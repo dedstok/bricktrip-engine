@@ -26,10 +26,9 @@ def import_batch(batch):
         return
 
     set_numbers = list({row["set_num"] for row in batch})
-
     existing_sets = set()
 
-    # Check smaller chunks so the database request does not get too large.
+    # Check which Brickset sets exist in our Rebrickable catalog.
     for i in range(0, len(set_numbers), 100):
         chunk = set_numbers[i:i + 100]
 
@@ -41,7 +40,9 @@ def import_batch(batch):
             .execute()
         )
 
-        existing_sets.update(row["set_num"] for row in response.data)
+        existing_sets.update(
+            row["set_num"] for row in response.data
+        )
 
     valid_rows = [
         row for row in batch
@@ -80,17 +81,18 @@ with open(CSV_FILE, newline="", encoding="utf-8-sig") as f:
     for item in reader:
         set_num = item["SetNumber"].strip()
         url = item["URL"].strip()
+        description = item["Description"].strip()
 
         if not set_num or not url:
             skipped += 1
             continue
 
-                batch.append({
+        batch.append({
             "set_num": set_num,
             "document_number": get_document_number(url),
             "source": "brickset-lego",
             "source_url": url,
-            "description": item["Description"].strip() or None,
+            "description": description or None,
         })
 
         if len(batch) >= 500:
