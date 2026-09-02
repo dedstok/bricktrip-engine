@@ -85,11 +85,12 @@ with open(CSV_FILE, newline="", encoding="utf-8-sig") as f:
             skipped += 1
             continue
 
-        batch.append({
+                batch.append({
             "set_num": set_num,
             "document_number": get_document_number(url),
             "source": "brickset-lego",
             "source_url": url,
+            "description": item["Description"].strip() or None,
         })
 
         if len(batch) >= 500:
