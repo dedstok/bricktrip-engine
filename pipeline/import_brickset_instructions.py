@@ -1,6 +1,7 @@
 import os
 import csv
 import re
+from datetime import datetime
 from supabase import create_client
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
@@ -17,6 +18,30 @@ skipped = 0
 def get_document_number(url):
     match = re.search(r"/(\d+)\.pdf", url)
     return match.group(1) if match else url
+
+
+def parse_brickset_date(value):
+    value = value.strip()
+
+    if not value:
+        return None
+
+    formats = [
+        "%d/%m/%Y %H:%M:%S",
+        "%d/%m/%y %H:%M",
+        "%d/%m/%Y",
+        "%d/%m/%y",
+    ]
+
+    for fmt in formats:
+        try:
+            parsed = datetime.strptime(value, fmt)
+            return parsed.isoformat()
+        except ValueError:
+            pass
+
+    print(f"Could not parse date: {value}")
+    return None
 
 
 def import_batch(batch):
@@ -93,8 +118,12 @@ with open(CSV_FILE, newline="", encoding="utf-8-sig") as f:
             "source": "brickset-lego",
             "source_url": url,
             "description": description or None,
-            "source_date_added": item["DateAdded"].strip() or None,
-            "source_date_modified": item["DateModified"].strip() or None,
+            "source_date_added": parse_brickset_date(
+                item["DateAdded"]
+            ),
+            "source_date_modified": parse_brickset_date(
+                item["DateModified"]
+            ),
         })
 
         if len(batch) >= 500:
