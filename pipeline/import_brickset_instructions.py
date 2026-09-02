@@ -93,6 +93,8 @@ with open(CSV_FILE, newline="", encoding="utf-8-sig") as f:
             "source": "brickset-lego",
             "source_url": url,
             "description": description or None,
+            "source_date_added": item["DateAdded"].strip() or None,
+            "source_date_modified": item["DateModified"].strip() or None,
         })
 
         if len(batch) >= 500:
