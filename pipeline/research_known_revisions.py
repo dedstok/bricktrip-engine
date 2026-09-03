@@ -1,8 +1,9 @@
+import hashlib
+import io
 import os
-import re
-from collections import defaultdict
-from datetime import datetime, timezone
 
+import requests
+from pypdf import PdfReader
 from supabase import create_client
 
 
@@ -16,1034 +17,601 @@ supabase = create_client(
 
 
 # ------------------------------------------------------------
-# CONTROLLED TEST ONLY
+# CONTROLLED READ-ONLY PDF TEST
 # ------------------------------------------------------------
 #
-# This worker intentionally ignores revision_candidates status.
+# We are testing LEGO set 10214-1 only.
 #
-# It reads ONLY these known test sets and PRINTS its findings.
+# These document pairs represent the SAME physical booklet slot
+# at different publication dates.
 #
-# It does NOT:
-# - insert evidence
-# - update revision_candidates
-# - create revisions
-# - modify any BrickTrip data
-#
-# We are validating the instruction-matching logic before
-# allowing the normal unattended queue to resume.
+# Nothing is inserted, updated, or deleted in Supabase.
 # ------------------------------------------------------------
 
-TEST_SET_NUMBERS = [
-    "42171-1",
-    "42129-1",
-    "60004-1",
-    "60085-1",
-    "10194-1",
-    "10214-1",
-    "31058-1",
+TEST_SET_NUM = "10214-1"
+
+TEST_PAIRS = [
+    {
+        "label": "Booklet 2/3 — 2010 vs 2011",
+        "older_document": "4611616",
+        "newer_document": "4658001",
+    },
+    {
+        "label": "Booklet 3/3 — 2010 vs 2011",
+        "older_document": "4611753",
+        "newer_document": "4658002",
+    },
+    {
+        "label": "Booklet 2/3 — 2011 vs 2015",
+        "older_document": "4658001",
+        "newer_document": "6145768",
+    },
+    {
+        "label": "Booklet 3/3 — 2011 vs 2015",
+        "older_document": "4658002",
+        "newer_document": "6145770",
+    },
+    {
+        "label": "Booklet 1/3 — 2012 vs 2015",
+        "older_document": "6020850",
+        "newer_document": "6146167",
+    },
 ]
 
 
-def parse_date(value):
+def get_instruction_documents():
     """
-    Convert a Supabase timestamp string into a Python datetime.
+    Load only the instruction documents needed for this test.
     """
-    if not value:
-        return None
+    document_numbers = []
 
-    try:
-        return datetime.fromisoformat(
-            value.replace("Z", "+00:00")
+    for pair in TEST_PAIRS:
+        document_numbers.append(
+            pair["older_document"]
         )
-    except ValueError:
-        return None
-
-
-def document_effective_date(document):
-    """
-    Prefer LEGO/Brickset's modification date.
-
-    Fall back to the date the document was added.
-    """
-    modified = parse_date(
-        document.get("source_date_modified")
-    )
-
-    if modified:
-        return modified
-
-    added = parse_date(
-        document.get("source_date_added")
-    )
-
-    if added:
-        return added
-
-    return None
-
-
-def document_sort_date(document):
-    """
-    Always return a timezone-aware date so documents can
-    safely be sorted.
-    """
-    effective_date = document_effective_date(
-        document
-    )
-
-    if effective_date:
-        return effective_date
-
-    return datetime.min.replace(
-        tzinfo=timezone.utc
-    )
-
-
-def generation_date_key(document):
-    """
-    Use the effective calendar date as the publication-date key.
-
-    Multiple documents on the same date may represent regional
-    versions of the same instruction publication.
-    """
-    effective_date = document_effective_date(
-        document
-    )
-
-    if not effective_date:
-        return None
-
-    return effective_date.date().isoformat()
-
-
-def is_main_instruction(document):
-    """
-    Ignore obvious translation, support, and alternate-model PDFs.
-
-    During revision research we want the main building instruction
-    documents, not translation sheets or LEGO's additional/extra
-    downloadable models.
-    """
-    description = (
-        document.get("description") or ""
-    ).lower()
-
-    source_url = (
-        document.get("source_url") or ""
-    ).lower()
-
-    ignore_terms = [
-        "translate",
-        "translation",
-        "additional.main",
-        "additional.extra",
-    ]
-
-    for term in ignore_terms:
-        if (
-            term in description
-            or term in source_url
-        ):
-            return False
-
-    return True
-
-
-def parse_versions(description):
-    """
-    Return every LEGO V-label present in a description.
-
-    Examples:
-
-    "42171 V29"
-        -> ("V29",)
-
-    "42129 V29/V118"
-        -> ("V29", "V118")
-
-    "10214 V46/39"
-        -> ("V46", "V39")
-
-    LEGO sometimes writes a later version after a slash without
-    repeating the V, so V46/39 means V46 and V39.
-    """
-    if not description:
-        return tuple()
-
-    text = description.upper()
-
-    versions = []
-
-    explicit_matches = re.findall(
-        r"\bV(\d+)(?:\s*/\s*(\d+))?",
-        text,
-    )
-
-    for first_number, second_number in explicit_matches:
-
-        first_version = f"V{first_number}"
-
-        if first_version not in versions:
-            versions.append(first_version)
-
-        if second_number:
-            second_version = f"V{second_number}"
-
-            if second_version not in versions:
-                versions.append(second_version)
-
-    return tuple(versions)
-
-
-def parse_booklet_slot(description):
-    """
-    Find a genuine booklet position such as:
-
-    1/2
-    2/3
-    4/5
-    BOOK 1/3
-    BOOK2/3
-
-    LEGO descriptions also contain printing/page codes such as:
-
-    BI 3004/60
-    264+4/65+200G
-
-    Those must NOT be mistaken for booklet positions.
-
-    For this research pass, a valid booklet fraction must satisfy:
-
-    - numerator >= 1
-    - denominator >= 2
-    - numerator <= denominator
-    - denominator <= 20
-
-    That safely captures the booklet structures we have inspected
-    while rejecting the large printing/page fractions.
-    """
-    if not description:
-        return None
-
-    text = description.upper()
-
-    matches = re.finditer(
-        r"(?<!\d)"
-        r"(\d{1,2})"
-        r"\s*/\s*"
-        r"(\d{1,2})"
-        r"(?!\d)",
-        text,
-    )
-
-    candidates = []
-
-    for match in matches:
-
-        numerator = int(
-            match.group(1)
+        document_numbers.append(
+            pair["newer_document"]
         )
 
-        denominator = int(
-            match.group(2)
-        )
+    document_numbers = sorted(
+        set(document_numbers)
+    )
 
-        if numerator < 1:
-            continue
-
-        if denominator < 2:
-            continue
-
-        if denominator > 20:
-            continue
-
-        if numerator > denominator:
-            continue
-
-        candidates.append(
-            (
-                numerator,
-                denominator,
-                match.start(),
-            )
-        )
-
-    if not candidates:
-        return None
-
-    # A LEGO BI printing code normally appears near the beginning
-    # of the description.
-    #
-    # Real booklet fractions generally occur later, around the set
-    # number / V-label portion.
-    #
-    # If several small fractions somehow exist, use the last one.
-    numerator, denominator, _ = candidates[-1]
-
-    return f"{numerator}/{denominator}"
-
-
-def get_instruction_documents(set_num):
-    """
-    Fetch all known instruction-document metadata for one LEGO set.
-    """
     response = (
         supabase
         .table("instruction_documents")
         .select(
-            "id,"
-            "set_num,"
             "document_number,"
             "description,"
             "source_url,"
             "source_date_added,"
             "source_date_modified"
         )
-        .eq("set_num", set_num)
+        .eq("set_num", TEST_SET_NUM)
+        .in_(
+            "document_number",
+            document_numbers,
+        )
         .execute()
     )
 
-    documents = response.data or []
+    documents = {}
 
-    documents.sort(
-        key=document_sort_date
-    )
+    for document in response.data or []:
+        number = str(
+            document.get("document_number")
+        )
+
+        documents[number] = document
 
     return documents
 
 
-def build_publication_generations(documents):
+def download_pdf(document):
     """
-    Collapse documents sharing the same effective calendar date
-    into one publication generation.
+    Download one official LEGO instruction PDF into memory.
     """
-    generations_by_date = defaultdict(list)
-
-    for document in documents:
-
-        date_key = generation_date_key(
-            document
-        )
-
-        if date_key is None:
-            continue
-
-        generations_by_date[
-            date_key
-        ].append(
-            document
-        )
-
-    generations = []
-
-    for date_key, generation_documents in (
-        generations_by_date.items()
-    ):
-
-        generation_documents.sort(
-            key=lambda document: str(
-                document.get("document_number")
-                or ""
-            )
-        )
-
-        generations.append({
-            "date_key": date_key,
-            "documents": generation_documents,
-        })
-
-    generations.sort(
-        key=lambda generation:
-        generation["date_key"]
+    document_number = str(
+        document.get("document_number")
     )
 
-    return generations
-
-
-def document_numbers(documents):
-    """
-    Return printable document numbers.
-    """
-    numbers = []
-
-    for document in documents:
-
-        number = document.get(
-            "document_number"
-        )
-
-        if number is not None:
-            numbers.append(
-                str(number)
-            )
-
-    return numbers
-
-
-def versions_in_documents(documents):
-    """
-    Return every V-label represented by a group of documents.
-    """
-    versions = []
-
-    for document in documents:
-
-        parsed_versions = parse_versions(
-            document.get("description")
-        )
-
-        for version in parsed_versions:
-
-            if version not in versions:
-                versions.append(
-                    version
-                )
-
-    return versions
-
-
-def choose_representative_document(documents):
-    """
-    Pick one deterministic document from a group.
-
-    This is only for displaying a representative URL/document
-    during testing.
-    """
-    if not documents:
-        return None
-
-    ordered = sorted(
-        documents,
-        key=lambda document: str(
-            document.get("document_number")
-            or ""
-        ),
+    source_url = document.get(
+        "source_url"
     )
 
-    return ordered[0]
-
-
-def build_booklet_groups(documents):
-    """
-    Group documents by physical booklet position.
-
-    Example:
-
-    1/3 -> all known PDFs representing booklet 1 of 3
-    2/3 -> all known PDFs representing booklet 2 of 3
-    3/3 -> all known PDFs representing booklet 3 of 3
-
-    Documents without a recognizable booklet slot are kept
-    separately.
-    """
-    booklet_groups = defaultdict(list)
-    unknown_slot_documents = []
-
-    for document in documents:
-
-        if not is_main_instruction(
-            document
-        ):
-            continue
-
-        slot = parse_booklet_slot(
-            document.get("description")
-        )
-
-        if slot:
-            booklet_groups[
-                slot
-            ].append(
-                document
-            )
-        else:
-            unknown_slot_documents.append(
-                document
-            )
-
-    for slot in booklet_groups:
-
-        booklet_groups[
-            slot
-        ].sort(
-            key=document_sort_date
-        )
-
-    unknown_slot_documents.sort(
-        key=document_sort_date
-    )
-
-    return (
-        booklet_groups,
-        unknown_slot_documents,
-    )
-
-
-def build_multi_booklet_pairs(booklet_groups):
-    """
-    Compare only LIKE-FOR-LIKE booklet positions.
-
-    1/3 may compare to a later 1/3.
-
-    1/3 must NEVER be compared with 2/3 simply because their
-    publication dates differ.
-
-    Each adjacent publication date inside the same booklet slot
-    becomes a PDF-comparison candidate.
-    """
-    pairs = []
-
-    for slot, documents in sorted(
-        booklet_groups.items()
-    ):
-
-        generations = (
-            build_publication_generations(
-                documents
-            )
-        )
-
-        if len(generations) < 2:
-            continue
-
-        for index in range(
-            len(generations) - 1
-        ):
-
-            older_generation = (
-                generations[index]
-            )
-
-            newer_generation = (
-                generations[index + 1]
-            )
-
-            pairs.append({
-                "mode": "booklet_slot",
-                "identity": slot,
-                "older_generation":
-                    older_generation,
-                "newer_generation":
-                    newer_generation,
-            })
-
-    return pairs
-
-
-def build_version_groups(documents):
-    """
-    For documents without booklet slots, group by LEGO V-label.
-
-    This handles single-booklet sets such as 42171.
-
-    It also catches cases like 42129 where one regional V-label
-    survives from the earlier publication into the later one.
-
-    A document containing V29/V118 belongs to both the V29 and
-    V118 groups.
-    """
-    version_groups = defaultdict(list)
-
-    for document in documents:
-
-        versions = parse_versions(
-            document.get("description")
-        )
-
-        for version in versions:
-
-            version_groups[
-                version
-            ].append(
-                document
-            )
-
-    for version in version_groups:
-
-        version_groups[
-            version
-        ].sort(
-            key=document_sort_date
-        )
-
-    return version_groups
-
-
-def build_single_booklet_pairs(documents):
-    """
-    For sets/documents without booklet positions, compare repeated
-    V-labels across distinct publication dates.
-
-    This is intentionally conservative.
-
-    We do NOT compare completely unrelated V-labels just because
-    their dates differ.
-    """
-    pairs = []
-
-    version_groups = (
-        build_version_groups(
-            documents
-        )
-    )
-
-    for version, version_documents in sorted(
-        version_groups.items()
-    ):
-
-        generations = (
-            build_publication_generations(
-                version_documents
-            )
-        )
-
-        if len(generations) < 2:
-            continue
-
-        for index in range(
-            len(generations) - 1
-        ):
-
-            older_generation = (
-                generations[index]
-            )
-
-            newer_generation = (
-                generations[index + 1]
-            )
-
-            pairs.append({
-                "mode": "version",
-                "identity": version,
-                "older_generation":
-                    older_generation,
-                "newer_generation":
-                    newer_generation,
-            })
-
-    return pairs
-
-
-def pair_key(pair):
-    """
-    Create a stable identity for deduplicating comparison pairs.
-
-    Two regional V-labels may point to the exact same old/new
-    publication dates. We keep their version-specific pairs for
-    this diagnostic run because seeing them is useful.
-
-    Multi-booklet pairs remain separated by booklet slot.
-    """
-    return (
-        pair["mode"],
-        pair["identity"],
-        pair["older_generation"][
-            "date_key"
-        ],
-        pair["newer_generation"][
-            "date_key"
-        ],
-    )
-
-
-def deduplicate_pairs(pairs):
-    """
-    Remove accidental exact duplicate pair records.
-    """
-    unique_pairs = []
-    seen = set()
-
-    for pair in pairs:
-
-        key = pair_key(
-            pair
-        )
-
-        if key in seen:
-            continue
-
-        seen.add(
-            key
-        )
-
-        unique_pairs.append(
-            pair
-        )
-
-    return unique_pairs
-
-
-def summarize_generation(generation):
-    """
-    Produce a readable publication-generation summary.
-    """
-    documents = (
-        generation["documents"]
-    )
-
-    numbers = document_numbers(
-        documents
-    )
-
-    versions = versions_in_documents(
-        documents
-    )
-
-    number_text = (
-        ", ".join(numbers)
-        if numbers
-        else "unknown document"
-    )
-
-    version_text = (
-        ", ".join(versions)
-        if versions
-        else "no V-label"
-    )
-
-    return (
-        f'{generation["date_key"]} '
-        f'[{number_text}] '
-        f'({version_text})'
-    )
-
-
-def summarize_pair(pair):
-    """
-    Produce a readable old -> new PDF comparison candidate.
-    """
-    older_text = summarize_generation(
-        pair["older_generation"]
-    )
-
-    newer_text = summarize_generation(
-        pair["newer_generation"]
-    )
-
-    if pair["mode"] == "booklet_slot":
-        label = (
-            f'booklet {pair["identity"]}'
-        )
-    else:
-        label = (
-            f'version {pair["identity"]}'
-        )
-
-    return (
-        f"{label}: "
-        f"{older_text} -> {newer_text}"
-    )
-
-
-def print_document_inventory(documents):
-    """
-    Print every primary instruction document with the metadata
-    parsed by the new algorithm.
-    """
-    print("")
-    print("Primary instruction documents:")
-
-    primary_count = 0
-
-    for document in documents:
-
-        if not is_main_instruction(
-            document
-        ):
-            continue
-
-        primary_count += 1
-
-        description = (
-            document.get("description")
-            or ""
-        )
-
-        number = (
-            document.get("document_number")
-            or "unknown"
-        )
-
-        date_key = generation_date_key(
-            document
-        )
-
-        slot = parse_booklet_slot(
-            description
-        )
-
-        versions = parse_versions(
-            description
-        )
-
-        slot_text = (
-            slot
-            if slot
-            else "none"
-        )
-
-        version_text = (
-            ", ".join(versions)
-            if versions
-            else "none"
-        )
-
-        print(
-            f"  {number}"
-        )
-
-        print(
-            f"    date: {date_key}"
-        )
-
-        print(
-            f"    booklet slot: {slot_text}"
-        )
-
-        print(
-            f"    versions: {version_text}"
-        )
-
-        print(
-            f"    description: {description}"
+    if not source_url:
+        raise RuntimeError(
+            f"Document {document_number} "
+            f"has no source_url."
         )
 
     print(
-        f"Primary document count: "
-        f"{primary_count}"
+        f"Downloading {document_number}..."
     )
 
+    response = requests.get(
+        source_url,
+        timeout=120,
+    )
 
-def print_booklet_structure(
-    booklet_groups,
-    unknown_slot_documents,
+    response.raise_for_status()
+
+    pdf_bytes = response.content
+
+    if not pdf_bytes.startswith(b"%PDF"):
+        raise RuntimeError(
+            f"Document {document_number} "
+            f"did not download as a PDF."
+        )
+
+    print(
+        f"  Downloaded "
+        f"{len(pdf_bytes):,} bytes"
+    )
+
+    return pdf_bytes
+
+
+def whole_file_hash(pdf_bytes):
+    """
+    Hash the entire downloaded PDF file.
+
+    Different whole-file hashes prove the files are not
+    byte-for-byte identical, but that alone does NOT prove the
+    building instructions changed.
+    """
+    return hashlib.sha256(
+        pdf_bytes
+    ).hexdigest()
+
+
+def page_content_bytes(page):
+    """
+    Get the decoded PDF content-stream bytes for one page.
+
+    This focuses on the page's actual drawing/text instructions
+    rather than the PDF file's outer metadata.
+    """
+    contents = page.get_contents()
+
+    if contents is None:
+        return b""
+
+    try:
+        return contents.get_data()
+
+    except AttributeError:
+        pass
+
+    try:
+        data_parts = []
+
+        for content in contents:
+            data_parts.append(
+                content.get_data()
+            )
+
+        return b"".join(
+            data_parts
+        )
+
+    except Exception:
+        return b""
+
+
+def page_content_hash(page):
+    """
+    Hash the decoded content stream for one PDF page.
+    """
+    content = page_content_bytes(
+        page
+    )
+
+    return hashlib.sha256(
+        content
+    ).hexdigest()
+
+
+def analyze_pdf(pdf_bytes):
+    """
+    Read a PDF and calculate page-level content hashes.
+    """
+    reader = PdfReader(
+        io.BytesIO(pdf_bytes)
+    )
+
+    page_hashes = []
+
+    for page in reader.pages:
+        page_hashes.append(
+            page_content_hash(
+                page
+            )
+        )
+
+    return {
+        "page_count": len(reader.pages),
+        "page_hashes": page_hashes,
+        "file_hash": whole_file_hash(
+            pdf_bytes
+        ),
+    }
+
+
+def compare_page_hashes(
+    older_analysis,
+    newer_analysis,
 ):
     """
-    Print how the new parser understands the physical booklet
-    structure for this set.
+    Compare same-numbered pages between two PDFs.
+
+    Returns:
+    - matching pages
+    - changed pages
+    - pages that exist only in one PDF
     """
-    print("")
-    print("Parsed instruction structure:")
+    older_hashes = (
+        older_analysis["page_hashes"]
+    )
 
-    if booklet_groups:
+    newer_hashes = (
+        newer_analysis["page_hashes"]
+    )
 
-        print(
-            f"  Recognized booklet slots: "
-            f"{len(booklet_groups)}"
-        )
+    shared_page_count = min(
+        len(older_hashes),
+        len(newer_hashes),
+    )
 
-        for slot, documents in sorted(
-            booklet_groups.items()
+    matching_pages = []
+    changed_pages = []
+
+    for index in range(
+        shared_page_count
+    ):
+        page_number = index + 1
+
+        if (
+            older_hashes[index]
+            == newer_hashes[index]
         ):
-
-            generations = (
-                build_publication_generations(
-                    documents
-                )
+            matching_pages.append(
+                page_number
+            )
+        else:
+            changed_pages.append(
+                page_number
             )
 
-            print(
-                f"  {slot}: "
-                f"{len(documents)} document(s), "
-                f"{len(generations)} dated "
-                f"publication generation(s)"
-            )
+    older_only_pages = list(
+        range(
+            shared_page_count + 1,
+            len(older_hashes) + 1,
+        )
+    )
 
-            for generation in generations:
+    newer_only_pages = list(
+        range(
+            shared_page_count + 1,
+            len(newer_hashes) + 1,
+        )
+    )
 
-                print(
-                    "    "
-                    + summarize_generation(
-                        generation
-                    )
-                )
+    return {
+        "matching_pages":
+            matching_pages,
+        "changed_pages":
+            changed_pages,
+        "older_only_pages":
+            older_only_pages,
+        "newer_only_pages":
+            newer_only_pages,
+    }
 
-    else:
-        print(
-            "  No explicit booklet slots found."
+
+def summarize_page_list(
+    pages,
+    maximum_display=40,
+):
+    """
+    Keep GitHub logs readable if many pages differ.
+    """
+    if not pages:
+        return "none"
+
+    if len(pages) <= maximum_display:
+        return ", ".join(
+            str(page)
+            for page in pages
         )
 
-    print(
-        f"  Documents with no booklet slot: "
-        f"{len(unknown_slot_documents)}"
+    visible = pages[
+        :maximum_display
+    ]
+
+    visible_text = ", ".join(
+        str(page)
+        for page in visible
+    )
+
+    remaining = (
+        len(pages)
+        - maximum_display
+    )
+
+    return (
+        f"{visible_text}, "
+        f"... +{remaining} more"
     )
 
 
-def research_test_set(set_num):
+def compare_pair(
+    pair,
+    documents,
+    pdf_cache,
+):
     """
-    Analyze one controlled test set.
+    Download and compare one old/new instruction pair.
+    """
+    older_number = pair[
+        "older_document"
+    ]
 
-    READ ONLY.
-    """
+    newer_number = pair[
+        "newer_document"
+    ]
+
     print("")
     print("=" * 72)
+    print(pair["label"])
     print(
-        f"TESTING {set_num}"
+        f"{older_number} -> "
+        f"{newer_number}"
     )
     print("=" * 72)
 
-    documents = (
-        get_instruction_documents(
-            set_num
+    older_document = documents.get(
+        older_number
+    )
+
+    newer_document = documents.get(
+        newer_number
+    )
+
+    if not older_document:
+        raise RuntimeError(
+            f"Could not find metadata for "
+            f"{older_number}."
+        )
+
+    if not newer_document:
+        raise RuntimeError(
+            f"Could not find metadata for "
+            f"{newer_number}."
+        )
+
+    print(
+        "Older description: "
+        + str(
+            older_document.get(
+                "description"
+            )
         )
     )
 
     print(
-        f"Instruction records fetched: "
-        f"{len(documents)}"
-    )
-
-    print_document_inventory(
-        documents
-    )
-
-    (
-        booklet_groups,
-        unknown_slot_documents,
-    ) = build_booklet_groups(
-        documents
-    )
-
-    print_booklet_structure(
-        booklet_groups,
-        unknown_slot_documents,
-    )
-
-    pairs = []
-
-    # --------------------------------------------------------
-    # MULTI-BOOKLET LOGIC
-    # --------------------------------------------------------
-    #
-    # If explicit booklet positions exist, compare only the same
-    # physical booklet slot across publication dates.
-    # --------------------------------------------------------
-
-    if booklet_groups:
-
-        multi_booklet_pairs = (
-            build_multi_booklet_pairs(
-                booklet_groups
+        "Newer description: "
+        + str(
+            newer_document.get(
+                "description"
             )
         )
+    )
 
-        pairs.extend(
-            multi_booklet_pairs
+    if older_number not in pdf_cache:
+        older_bytes = download_pdf(
+            older_document
         )
 
-        # Documents lacking booklet markers are deliberately NOT
-        # matched against numbered booklet slots.
-        #
-        # If there are enough unnumbered documents to establish
-        # repeated V-labels safely, we may still inspect those
-        # independently.
-
-        unknown_pairs = (
-            build_single_booklet_pairs(
-                unknown_slot_documents
-            )
+        pdf_cache[
+            older_number
+        ] = analyze_pdf(
+            older_bytes
         )
 
-        pairs.extend(
-            unknown_pairs
+    if newer_number not in pdf_cache:
+        newer_bytes = download_pdf(
+            newer_document
         )
 
-    # --------------------------------------------------------
-    # SINGLE-BOOKLET / NO-SLOT LOGIC
-    # --------------------------------------------------------
+        pdf_cache[
+            newer_number
+        ] = analyze_pdf(
+            newer_bytes
+        )
+
+    older_analysis = pdf_cache[
+        older_number
+    ]
+
+    newer_analysis = pdf_cache[
+        newer_number
+    ]
+
+    comparison = compare_page_hashes(
+        older_analysis,
+        newer_analysis,
+    )
+
+    print("")
+    print(
+        f"Older page count: "
+        f'{older_analysis["page_count"]}'
+    )
+
+    print(
+        f"Newer page count: "
+        f'{newer_analysis["page_count"]}'
+    )
+
+    same_whole_file = (
+        older_analysis["file_hash"]
+        == newer_analysis["file_hash"]
+    )
+
+    print(
+        f"Whole PDFs byte-identical: "
+        f"{same_whole_file}"
+    )
+
+    matching_count = len(
+        comparison["matching_pages"]
+    )
+
+    changed_count = len(
+        comparison["changed_pages"]
+    )
+
+    print(
+        f"Same-position matching pages: "
+        f"{matching_count}"
+    )
+
+    print(
+        f"Same-position changed pages: "
+        f"{changed_count}"
+    )
+
+    print(
+        "Changed page numbers: "
+        + summarize_page_list(
+            comparison[
+                "changed_pages"
+            ]
+        )
+    )
+
+    print(
+        "Pages only in older PDF: "
+        + summarize_page_list(
+            comparison[
+                "older_only_pages"
+            ]
+        )
+    )
+
+    print(
+        "Pages only in newer PDF: "
+        + summarize_page_list(
+            comparison[
+                "newer_only_pages"
+            ]
+        )
+    )
+
+    print("")
+
+    if (
+        same_whole_file
+        and changed_count == 0
+        and not comparison[
+            "older_only_pages"
+        ]
+        and not comparison[
+            "newer_only_pages"
+        ]
+    ):
+        verdict = (
+            "IDENTICAL PDF"
+        )
+
+    elif (
+        changed_count == 0
+        and not comparison[
+            "older_only_pages"
+        ]
+        and not comparison[
+            "newer_only_pages"
+        ]
+    ):
+        verdict = (
+            "SAME PAGE CONTENT; "
+            "PDF FILE WRAPPER/METADATA DIFFERS"
+        )
 
     else:
-
-        pairs.extend(
-            build_single_booklet_pairs(
-                unknown_slot_documents
-            )
+        verdict = (
+            "PAGE CONTENT DIFFERS — "
+            "needs deeper visual/step comparison"
         )
 
-    pairs = deduplicate_pairs(
-        pairs
-    )
-
-    print("")
     print(
-        "PDF comparison candidates: "
-        f"{len(pairs)}"
-    )
-
-    if not pairs:
-
-        print(
-            "  None found from current metadata."
-        )
-
-    for pair in pairs:
-
-        print(
-            "  "
-            + summarize_pair(
-                pair
-            )
-        )
-
-    print("")
-    print(
-        "DATABASE WRITES: NONE"
+        f"VERDICT: {verdict}"
     )
 
 
 def main():
     print("")
     print(
-        "BrickTrip Revision Matching Diagnostic"
+        "BrickTrip Official LEGO PDF Comparison"
     )
     print(
         "======================================"
     )
     print(
-        "READ-ONLY CONTROLLED TEST"
+        f"Controlled test set: "
+        f"{TEST_SET_NUM}"
     )
     print(
-        "No evidence or candidate statuses "
-        "will be changed."
+        "READ ONLY — database writes: NONE"
     )
+
+    documents = (
+        get_instruction_documents()
+    )
+
     print("")
     print(
-        f"Test sets: "
-        f"{len(TEST_SET_NUMBERS)}"
+        f"Required instruction documents found: "
+        f"{len(documents)}"
     )
+
+    pdf_cache = {}
 
     succeeded = 0
     failed = 0
 
-    for set_num in TEST_SET_NUMBERS:
+    for pair in TEST_PAIRS:
 
         try:
-
-            research_test_set(
-                set_num
+            compare_pair(
+                pair,
+                documents,
+                pdf_cache,
             )
 
             succeeded += 1
 
         except Exception as error:
-
             failed += 1
 
             print("")
             print(
-                f"ERROR testing "
-                f"{set_num}: "
+                f"ERROR comparing "
+                f'{pair["label"]}: '
                 f"{error}"
             )
 
     print("")
     print("=" * 72)
-    print("DIAGNOSTIC COMPLETE")
+    print("PDF TEST COMPLETE")
     print(
-        f"Succeeded: {succeeded}"
+        f"Comparisons succeeded: "
+        f"{succeeded}"
     )
     print(
-        f"Failed: {failed}"
+        f"Comparisons failed: "
+        f"{failed}"
     )
     print(
         "Database writes: 0"
