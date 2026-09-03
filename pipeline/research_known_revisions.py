@@ -12,8 +12,9 @@ supabase = create_client(
     SUPABASE_SECRET_KEY
 )
 
-# Safety limit while we test the worker.
-MAX_SETS_PER_RUN = 10
+# TEMPORARY TEST:
+# Research only the four candidates previously touched by the old logic.
+TEST_CANDIDATE_IDS = [22, 15, 24, 4]
 
 
 def parse_version(description):
@@ -136,14 +137,15 @@ def generation_date_key(document):
 
 def get_known_redesign_queue():
     """
-    Fetch known redesigns that still need research.
+    TEMPORARY TEST:
+    Fetch only the four known candidates we want to retest.
     """
     response = (
         supabase
         .table("revision_candidates")
         .select("id,set_num,status")
+        .in_("id", TEST_CANDIDATE_IDS)
         .eq("status", "needs_research")
-        .limit(MAX_SETS_PER_RUN)
         .execute()
     )
 
@@ -174,10 +176,8 @@ def group_instruction_variants(documents):
     """
     Group primary instruction documents by LEGO variant.
 
-    Example:
-
-    V29 documents are compared only with other V29 documents.
-    V39 documents are compared only with other V39 documents.
+    V29 documents are compared only with V29 documents.
+    V39 documents are compared only with V39 documents.
     """
     groups = defaultdict(list)
 
@@ -211,11 +211,10 @@ def build_publication_generations(documents):
     into one publication generation.
 
     A generation may contain more than one document number.
-    That is expected and does not automatically mean multiple
-    physical set redesigns.
+    That does not automatically mean multiple physical set
+    redesigns.
     """
     generations_by_date = defaultdict(list)
-    undated_documents = []
 
     for document in documents:
 
@@ -224,9 +223,6 @@ def build_publication_generations(documents):
         )
 
         if date_key is None:
-            undated_documents.append(
-                document
-            )
             continue
 
         generations_by_date[date_key].append(
@@ -255,18 +251,13 @@ def build_publication_generations(documents):
             generation["date_key"]
     )
 
-    # Undated documents cannot currently establish chronology,
-    # so they are deliberately excluded from comparison pairs.
     return generations
 
 
 def choose_generation_representative(generation):
     """
-    Pick one representative document for a publication generation.
-
-    We retain the full generation in memory, but use a stable
-    representative document when creating evidence for later
-    PDF analysis.
+    Pick one stable representative document for a publication
+    generation.
     """
     documents = generation["documents"]
 
@@ -424,7 +415,6 @@ def save_evidence(set_num, pairs):
             )
         )
 
-        # Avoid adding the exact same evidence repeatedly.
         existing = (
             supabase
             .table("evidence")
@@ -594,8 +584,7 @@ def main():
         "========================================"
     )
     print(
-        f"Maximum sets this run: "
-        f"{MAX_SETS_PER_RUN}"
+        "TEMPORARY TARGETED TEST"
     )
 
     queue = (
