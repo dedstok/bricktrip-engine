@@ -1,7 +1,7 @@
 import os
 import re
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from supabase import create_client
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
@@ -18,12 +18,15 @@ MAX_SETS_PER_RUN = 10
 
 def parse_version(description):
     """
-    Pulls LEGO instruction variant labels such as V29, V39, etc.
+    Pull LEGO instruction variant labels such as V29, V39, etc.
     """
     if not description:
         return None
 
-    matches = re.findall(r"\bV\d+\b", description.upper())
+    matches = re.findall(
+        r"\bV\d+\b",
+        description.upper()
+    )
 
     if not matches:
         return None
@@ -36,7 +39,7 @@ def is_main_instruction(document):
     Ignore obvious translation/support PDFs.
 
     We only want primary building instructions during this
-    first research pass.
+    research pass.
     """
     description = (
         document.get("description") or ""
@@ -53,7 +56,10 @@ def is_main_instruction(document):
     ]
 
     for term in ignore_terms:
-        if term in description or term in source_url:
+        if (
+            term in description
+            or term in source_url
+        ):
             return False
 
     return True
@@ -71,7 +77,7 @@ def parse_date(value):
         return None
 
 
-def document_sort_date(document):
+def document_effective_date(document):
     """
     Prefer LEGO/Brickset modification date.
     Fall back to date added.
@@ -90,7 +96,42 @@ def document_sort_date(document):
     if added:
         return added
 
-    return datetime.min
+    return None
+
+
+def document_sort_date(document):
+    """
+    Return a timezone-aware value so dated and undated
+    documents can always be sorted safely.
+    """
+    effective_date = document_effective_date(
+        document
+    )
+
+    if effective_date:
+        return effective_date
+
+    return datetime.min.replace(
+        tzinfo=timezone.utc
+    )
+
+
+def generation_date_key(document):
+    """
+    Documents with the same effective calendar date are treated
+    as belonging to the same publication generation.
+
+    This prevents multiple LEGO PDFs published/modified on the
+    same day from being mistaken for separate redesign events.
+    """
+    effective_date = document_effective_date(
+        document
+    )
+
+    if not effective_date:
+        return None
+
+    return effective_date.date().isoformat()
 
 
 def get_known_redesign_queue():
@@ -129,18 +170,14 @@ def get_instruction_documents(set_num):
     return response.data or []
 
 
-def group_instruction_generations(documents):
+def group_instruction_variants(documents):
     """
-    Group comparable instructions by LEGO variant.
+    Group primary instruction documents by LEGO variant.
 
     Example:
 
-    6509262 V29
-    6562097 V29
-
-    become one comparison group.
-
-    Likewise V39 is compared only against V39.
+    V29 documents are compared only with other V29 documents.
+    V39 documents are compared only with other V39 documents.
     """
     groups = defaultdict(list)
 
@@ -156,7 +193,9 @@ def group_instruction_generations(documents):
         if not version:
             continue
 
-        groups[version].append(document)
+        groups[version].append(
+            document
+        )
 
     for version in groups:
         groups[version].sort(
@@ -166,52 +205,198 @@ def group_instruction_generations(documents):
     return groups
 
 
-def build_comparison_pairs(groups):
+def build_publication_generations(documents):
     """
-    Build old -> new comparison pairs inside each
-    matching instruction variant.
+    Collapse documents from the same effective calendar date
+    into one publication generation.
+
+    A generation may contain more than one document number.
+    That is expected and does not automatically mean multiple
+    physical set redesigns.
+    """
+    generations_by_date = defaultdict(list)
+    undated_documents = []
+
+    for document in documents:
+
+        date_key = generation_date_key(
+            document
+        )
+
+        if date_key is None:
+            undated_documents.append(
+                document
+            )
+            continue
+
+        generations_by_date[date_key].append(
+            document
+        )
+
+    generations = []
+
+    for date_key, generation_documents in (
+        generations_by_date.items()
+    ):
+        generation_documents.sort(
+            key=lambda document: str(
+                document.get("document_number")
+                or ""
+            )
+        )
+
+        generations.append({
+            "date_key": date_key,
+            "documents": generation_documents,
+        })
+
+    generations.sort(
+        key=lambda generation:
+            generation["date_key"]
+    )
+
+    # Undated documents cannot currently establish chronology,
+    # so they are deliberately excluded from comparison pairs.
+    return generations
+
+
+def choose_generation_representative(generation):
+    """
+    Pick one representative document for a publication generation.
+
+    We retain the full generation in memory, but use a stable
+    representative document when creating evidence for later
+    PDF analysis.
+    """
+    documents = generation["documents"]
+
+    if not documents:
+        return None
+
+    return documents[0]
+
+
+def build_comparison_pairs(variant_groups):
+    """
+    Build old -> new comparison pairs between DISTINCT dated
+    publication generations inside each matching LEGO variant.
+
+    Multiple PDFs sharing the same effective date are treated
+    as one generation rather than being chained together.
     """
     pairs = []
 
-    for version, documents in groups.items():
+    for version, documents in (
+        variant_groups.items()
+    ):
 
-        if len(documents) < 2:
+        generations = (
+            build_publication_generations(
+                documents
+            )
+        )
+
+        if len(generations) < 2:
             continue
 
-        for index in range(len(documents) - 1):
+        for index in range(
+            len(generations) - 1
+        ):
+            older_generation = (
+                generations[index]
+            )
 
-            older = documents[index]
-            newer = documents[index + 1]
+            newer_generation = (
+                generations[index + 1]
+            )
+
+            older = (
+                choose_generation_representative(
+                    older_generation
+                )
+            )
+
+            newer = (
+                choose_generation_representative(
+                    newer_generation
+                )
+            )
+
+            if not older or not newer:
+                continue
 
             pairs.append({
                 "version": version,
                 "older": older,
                 "newer": newer,
+                "older_generation":
+                    older_generation,
+                "newer_generation":
+                    newer_generation,
             })
 
     return pairs
 
 
-def summarize_pair(pair):
-    older = pair["older"]
-    newer = pair["newer"]
+def generation_document_numbers(generation):
+    """
+    Return all document numbers found inside one publication
+    generation.
+    """
+    numbers = []
 
-    older_date = (
-        older.get("source_date_modified")
-        or older.get("source_date_added")
+    for document in generation["documents"]:
+        number = document.get(
+            "document_number"
+        )
+
+        if number is not None:
+            numbers.append(
+                str(number)
+            )
+
+    return numbers
+
+
+def summarize_pair(pair):
+    older_generation = (
+        pair["older_generation"]
     )
 
-    newer_date = (
-        newer.get("source_date_modified")
-        or newer.get("source_date_added")
+    newer_generation = (
+        pair["newer_generation"]
+    )
+
+    older_numbers = (
+        generation_document_numbers(
+            older_generation
+        )
+    )
+
+    newer_numbers = (
+        generation_document_numbers(
+            newer_generation
+        )
+    )
+
+    older_number_text = (
+        ", ".join(older_numbers)
+        if older_numbers
+        else "unknown document"
+    )
+
+    newer_number_text = (
+        ", ".join(newer_numbers)
+        if newer_numbers
+        else "unknown document"
     )
 
     return (
         f'{pair["version"]}: '
-        f'{older.get("document_number")} '
-        f'({older_date}) -> '
-        f'{newer.get("document_number")} '
-        f'({newer_date})'
+        f'{older_generation["date_key"]} '
+        f'[{older_number_text}] -> '
+        f'{newer_generation["date_key"]} '
+        f'[{newer_number_text}]'
     )
 
 
@@ -219,11 +404,13 @@ def save_evidence(set_num, pairs):
     """
     Save what the worker discovered.
 
-    This does NOT claim that a revision has been verified.
-    It records instruction-generation evidence for later
-    PDF comparison.
-    """
+    This does NOT claim that a physical revision has been
+    verified.
 
+    It only records that distinct dated instruction publication
+    generations exist and are ready for later official-PDF
+    comparison.
+    """
     for pair in pairs:
 
         description = (
@@ -232,7 +419,9 @@ def save_evidence(set_num, pairs):
         )
 
         newer_url = (
-            pair["newer"].get("source_url")
+            pair["newer"].get(
+                "source_url"
+            )
         )
 
         # Avoid adding the exact same evidence repeatedly.
@@ -245,7 +434,10 @@ def save_evidence(set_num, pairs):
                 "source_type",
                 "instruction_generation"
             )
-            .eq("description", description)
+            .eq(
+                "description",
+                description
+            )
             .execute()
         )
 
@@ -259,33 +451,45 @@ def save_evidence(set_num, pairs):
                 "set_num": set_num,
                 "source_type":
                     "instruction_generation",
-                "source_url": newer_url,
-                "description": description,
-                "confidence": 0.50,
+                "source_url":
+                    newer_url,
+                "description":
+                    description,
+                "confidence":
+                    0.50,
             })
             .execute()
         )
 
 
-def update_candidate(candidate_id, pairs):
+def update_candidate(
+    candidate_id,
+    pairs
+):
     """
-    Mark this queue item according to what this
-    metadata pass discovered.
+    Mark this queue item according to what this metadata pass
+    discovered.
     """
-
     if pairs:
-        status = "instruction_pairs_found"
+        status = (
+            "instruction_pairs_found"
+        )
+
         reason = (
             f"Known redesign. Found "
-            f"{len(pairs)} comparable instruction "
-            f"generation pair(s). Ready for PDF analysis."
+            f"{len(pairs)} distinct dated "
+            f"instruction generation pair(s). "
+            f"Ready for PDF analysis."
         )
     else:
-        status = "manual_or_deeper_research"
+        status = (
+            "manual_or_deeper_research"
+        )
+
         reason = (
             "Known redesign, but no comparable "
-            "instruction generations were found "
-            "from current metadata."
+            "distinct dated instruction generations "
+            "were found from current metadata."
         )
 
     (
@@ -294,9 +498,15 @@ def update_candidate(candidate_id, pairs):
         .update({
             "status": status,
             "reason": reason,
-            "updated_at": datetime.now().isoformat(),
+            "updated_at":
+                datetime.now(
+                    timezone.utc
+                ).isoformat(),
         })
-        .eq("id", candidate_id)
+        .eq(
+            "id",
+            candidate_id
+        )
         .execute()
     )
 
@@ -306,27 +516,52 @@ def research_set(candidate):
 
     print("")
     print("=" * 60)
-    print(f"Researching {set_num}")
+    print(
+        f"Researching {set_num}"
+    )
     print("=" * 60)
 
-    documents = get_instruction_documents(
-        set_num
+    documents = (
+        get_instruction_documents(
+            set_num
+        )
     )
 
     print(
-        f"Instruction records: {len(documents)}"
+        f"Instruction records: "
+        f"{len(documents)}"
     )
 
-    groups = group_instruction_generations(
-        documents
+    variant_groups = (
+        group_instruction_variants(
+            documents
+        )
     )
 
     print(
         f"Comparable variant groups: "
-        f"{len(groups)}"
+        f"{len(variant_groups)}"
     )
 
-    pairs = build_comparison_pairs(groups)
+    for version, variant_documents in (
+        variant_groups.items()
+    ):
+        generations = (
+            build_publication_generations(
+                variant_documents
+            )
+        )
+
+        print(
+            f"  {version}: "
+            f"{len(variant_documents)} document(s), "
+            f"{len(generations)} dated "
+            f"generation(s)"
+        )
+
+    pairs = build_comparison_pairs(
+        variant_groups
+    )
 
     print(
         f"Generation pairs found: "
@@ -351,19 +586,25 @@ def research_set(candidate):
 
 
 def main():
-
     print("")
-    print("BrickTrip Known Revision Research Worker")
-    print("========================================")
+    print(
+        "BrickTrip Known Revision Research Worker"
+    )
+    print(
+        "========================================"
+    )
     print(
         f"Maximum sets this run: "
         f"{MAX_SETS_PER_RUN}"
     )
 
-    queue = get_known_redesign_queue()
+    queue = (
+        get_known_redesign_queue()
+    )
 
     print(
-        f"Queue items loaded: {len(queue)}"
+        f"Queue items loaded: "
+        f"{len(queue)}"
     )
 
     processed = 0
@@ -372,7 +613,10 @@ def main():
     for candidate in queue:
 
         try:
-            research_set(candidate)
+            research_set(
+                candidate
+            )
+
             processed += 1
 
         except Exception as error:
@@ -395,24 +639,39 @@ def main():
                 "success"
                 if failed == 0
                 else "completed_with_errors",
-            "records_processed": processed,
-            "records_created": 0,
+            "records_processed":
+                processed,
+            "records_created":
+                0,
             "error_message":
                 None
                 if failed == 0
-                else f"{failed} set(s) failed.",
+                else (
+                    f"{failed} set(s) "
+                    f"failed."
+                ),
             "finished_at":
-                datetime.now().isoformat(),
+                datetime.now(
+                    timezone.utc
+                ).isoformat(),
         })
         .execute()
     )
 
     print("")
-    print("========================================")
+    print(
+        "========================================"
+    )
     print("RUN COMPLETE")
-    print(f"Processed: {processed}")
-    print(f"Failed: {failed}")
-    print("========================================")
+    print(
+        f"Processed: {processed}"
+    )
+    print(
+        f"Failed: {failed}"
+    )
+    print(
+        "========================================"
+    )
 
 
 if __name__ == "__main__":
