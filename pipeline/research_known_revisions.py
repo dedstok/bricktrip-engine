@@ -12,9 +12,8 @@ supabase = create_client(
     SUPABASE_SECRET_KEY
 )
 
-# TEMPORARY TEST:
-# Research only the four candidates previously touched by the old logic.
-TEST_CANDIDATE_IDS = [22, 15, 24, 4]
+# Safety limit while we continue testing the worker.
+MAX_SETS_PER_RUN = 10
 
 
 def parse_version(description):
@@ -137,15 +136,14 @@ def generation_date_key(document):
 
 def get_known_redesign_queue():
     """
-    TEMPORARY TEST:
-    Fetch only the four known candidates we want to retest.
+    Fetch known redesigns that still need research.
     """
     response = (
         supabase
         .table("revision_candidates")
         .select("id,set_num,status")
-        .in_("id", TEST_CANDIDATE_IDS)
         .eq("status", "needs_research")
+        .limit(MAX_SETS_PER_RUN)
         .execute()
     )
 
@@ -584,7 +582,8 @@ def main():
         "========================================"
     )
     print(
-        "TEMPORARY TARGETED TEST"
+        f"Maximum sets this run: "
+        f"{MAX_SETS_PER_RUN}"
     )
 
     queue = (
