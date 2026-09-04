@@ -2,3 +2,4 @@ supabase
 requests
 pypdf
 pymupdf
+Pillow
