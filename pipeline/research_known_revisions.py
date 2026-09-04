@@ -1,9 +1,10 @@
 import os
 from pathlib import Path
 
+import cv2
+import numpy as np
 import pymupdf
 import requests
-from PIL import Image, ImageDraw, ImageFont
 from supabase import create_client
 
 
@@ -17,18 +18,19 @@ supabase = create_client(
 
 
 # ------------------------------------------------------------
-# CONTROLLED READ-ONLY VISUAL INSPECTION TEST
+# READ-ONLY STRUCTURAL COMPARISON TEST
 # ------------------------------------------------------------
 #
-# LEGO set 10214-1 only.
+# Negative control:
+#   10214-1
+#   Same build / later visual refresh
 #
-# This test creates side-by-side PNG images so we can visually
-# inspect what changed between older and newer LEGO instructions.
+# Positive control:
+#   42129-1
+#   Known real production redesign
 #
-# NOTHING is written to Supabase.
+# Nothing is written to Supabase.
 # ------------------------------------------------------------
-
-TEST_SET_NUM = "10214-1"
 
 
 OUTPUT_DIR = Path(
@@ -36,66 +38,57 @@ OUTPUT_DIR = Path(
 )
 
 
-# Render slightly larger than native PDF resolution so details
-# are easy to inspect.
-RENDER_SCALE = 1.5
-
-
-COMPARISONS = [
+CONTROLS = [
     {
-        "booklet": "2_of_3",
-        "label": "Booklet 2/3 - 2011 vs 2015",
+        "name": "10214_negative_control",
+        "set_num": "10214-1",
+        "label": "10214 same-build visual refresh",
         "older_document": "4658001",
         "newer_document": "6145768",
-        "pages": [
-            2,
-            30,
-            59,
-        ],
     },
     {
-        "booklet": "3_of_3",
-        "label": "Booklet 3/3 - 2011 vs 2015",
-        "older_document": "4658002",
-        "newer_document": "6145770",
-        "pages": [
-            14,
-            42,
-        ],
-    },
-    {
-        "booklet": "1_of_3",
-        "label": "Booklet 1/3 - 2012 vs 2015",
-        "older_document": "6020850",
-        "newer_document": "6146167",
-        "pages": [
-            22,
-            30,
-        ],
+        "name": "42129_positive_control",
+        "set_num": "42129-1",
+        "label": "42129 known production redesign",
+        "older_document": "6396686",
+        "newer_document": "6411661",
     },
 ]
 
 
-def get_instruction_documents():
+# ------------------------------------------------------------
+# IMAGE SETTINGS
+# ------------------------------------------------------------
+
+RENDER_SCALE = 0.45
+
+NORMALIZED_SIZE = 420
+
+WHITE_THRESHOLD = 245
+
+CROP_PADDING = 8
+
+CANNY_LOW = 50
+
+CANNY_HIGH = 140
+
+# Small dilation makes the comparison tolerant of tiny shifts
+# caused by slightly different PDF rendering.
+EDGE_DILATION_SIZE = 3
+
+# Save the worst-scoring pages for visual inspection.
+LOWEST_PAGES_TO_SAVE = 10
+
+
+def get_document(set_num, document_number):
     """
-    Fetch metadata only for the instruction documents used in
-    this controlled test.
+    Fetch one known instruction document.
     """
-    required_numbers = set()
-
-    for comparison in COMPARISONS:
-        required_numbers.add(
-            comparison["older_document"]
-        )
-
-        required_numbers.add(
-            comparison["newer_document"]
-        )
-
     response = (
         supabase
         .table("instruction_documents")
         .select(
+            "set_num,"
             "document_number,"
             "description,"
             "source_url,"
@@ -104,39 +97,34 @@ def get_instruction_documents():
         )
         .eq(
             "set_num",
-            TEST_SET_NUM,
+            set_num,
         )
-        .in_(
+        .eq(
             "document_number",
-            sorted(required_numbers),
+            document_number,
         )
+        .limit(1)
         .execute()
     )
 
-    documents = {}
+    rows = response.data or []
 
-    for document in response.data or []:
-        document_number = str(
-            document.get(
-                "document_number"
-            )
+    if not rows:
+        raise RuntimeError(
+            f"Instruction document "
+            f"{document_number} "
+            f"for {set_num} was not found."
         )
 
-        documents[
-            document_number
-        ] = document
-
-    return documents
+    return rows[0]
 
 
 def download_pdf(document):
     """
-    Download one official LEGO PDF into memory.
+    Download one official LEGO instruction PDF.
     """
     document_number = str(
-        document.get(
-            "document_number"
-        )
+        document["document_number"]
     )
 
     source_url = document.get(
@@ -155,7 +143,7 @@ def download_pdf(document):
 
     response = requests.get(
         source_url,
-        timeout=180,
+        timeout=240,
     )
 
     response.raise_for_status()
@@ -188,33 +176,10 @@ def open_pdf(pdf_bytes):
     )
 
 
-def render_page(pdf, page_number):
+def render_page(page):
     """
-    Render one human-numbered PDF page to a Pillow RGB image.
-
-    page_number 1 means PDF page index 0.
+    Render a PDF page to grayscale numpy array.
     """
-    page_index = (
-        page_number - 1
-    )
-
-    if page_index < 0:
-        raise RuntimeError(
-            f"Invalid page number "
-            f"{page_number}."
-        )
-
-    if page_index >= len(pdf):
-        raise RuntimeError(
-            f"Requested page "
-            f"{page_number}, but PDF has "
-            f"only {len(pdf)} pages."
-        )
-
-    page = pdf[
-        page_index
-    ]
-
     matrix = pymupdf.Matrix(
         RENDER_SCALE,
         RENDER_SCALE,
@@ -222,325 +187,456 @@ def render_page(pdf, page_number):
 
     pixmap = page.get_pixmap(
         matrix=matrix,
-        colorspace=pymupdf.csRGB,
+        colorspace=pymupdf.csGRAY,
         alpha=False,
     )
 
-    image = Image.frombytes(
-        "RGB",
-        (
-            pixmap.width,
-            pixmap.height,
-        ),
+    image = np.frombuffer(
         pixmap.samples,
+        dtype=np.uint8,
+    )
+
+    image = image.reshape(
+        pixmap.height,
+        pixmap.width,
     )
 
     return image
 
 
-def fit_image_to_height(
-    image,
-    target_height,
-):
+def find_content_bbox(image):
     """
-    Resize an image while preserving aspect ratio.
+    Find the printed content area while ignoring white margins.
     """
-    if image.height == target_height:
-        return image
-
-    scale = (
-        target_height
-        / image.height
+    mask = (
+        image < WHITE_THRESHOLD
+    ).astype(
+        np.uint8
     )
 
-    target_width = max(
+    coordinates = cv2.findNonZero(
+        mask
+    )
+
+    if coordinates is None:
+        return (
+            0,
+            0,
+            image.shape[1],
+            image.shape[0],
+        )
+
+    x, y, width, height = cv2.boundingRect(
+        coordinates
+    )
+
+    left = max(
+        0,
+        x - CROP_PADDING,
+    )
+
+    top = max(
+        0,
+        y - CROP_PADDING,
+    )
+
+    right = min(
+        image.shape[1],
+        x + width + CROP_PADDING,
+    )
+
+    bottom = min(
+        image.shape[0],
+        y + height + CROP_PADDING,
+    )
+
+    return (
+        left,
+        top,
+        right,
+        bottom,
+    )
+
+
+def normalize_page(image):
+    """
+    Crop margins and fit the content into a fixed-size canvas.
+    """
+    left, top, right, bottom = (
+        find_content_bbox(
+            image
+        )
+    )
+
+    cropped = image[
+        top:bottom,
+        left:right,
+    ]
+
+    if cropped.size == 0:
+        return np.full(
+            (
+                NORMALIZED_SIZE,
+                NORMALIZED_SIZE,
+            ),
+            255,
+            dtype=np.uint8,
+        )
+
+    available_size = (
+        NORMALIZED_SIZE - 20
+    )
+
+    height, width = (
+        cropped.shape
+    )
+
+    scale = min(
+        available_size / width,
+        available_size / height,
+    )
+
+    new_width = max(
         1,
         round(
-            image.width
-            * scale
+            width * scale
         ),
     )
 
-    return image.resize(
+    new_height = max(
+        1,
+        round(
+            height * scale
+        ),
+    )
+
+    resized = cv2.resize(
+        cropped,
         (
-            target_width,
-            target_height,
+            new_width,
+            new_height,
         ),
-        Image.Resampling.LANCZOS,
+        interpolation=cv2.INTER_AREA,
     )
 
-
-def get_font():
-    """
-    Use Pillow's built-in default font.
-
-    No external font files are required.
-    """
-    return ImageFont.load_default()
-
-
-def draw_centered_text(
-    draw,
-    text,
-    center_x,
-    y,
-    font,
-):
-    """
-    Draw simple centered text.
-    """
-    bbox = draw.textbbox(
+    canvas = np.full(
         (
-            0,
-            0,
+            NORMALIZED_SIZE,
+            NORMALIZED_SIZE,
         ),
-        text,
-        font=font,
-    )
-
-    text_width = (
-        bbox[2]
-        - bbox[0]
+        255,
+        dtype=np.uint8,
     )
 
     x = (
-        center_x
-        - text_width // 2
-    )
+        NORMALIZED_SIZE
+        - new_width
+    ) // 2
 
-    draw.text(
+    y = (
+        NORMALIZED_SIZE
+        - new_height
+    ) // 2
+
+    canvas[
+        y:y + new_height,
+        x:x + new_width,
+    ] = resized
+
+    return canvas
+
+
+def create_edge_map(image):
+    """
+    Convert normalized page into a structural edge map.
+
+    This intentionally ignores LEGO's color palette as much as
+    possible and focuses on boundaries, lines, and geometry.
+    """
+    blurred = cv2.GaussianBlur(
+        image,
         (
-            x,
-            y,
+            3,
+            3,
         ),
-        text,
-        fill="black",
-        font=font,
+        0,
     )
 
+    edges = cv2.Canny(
+        blurred,
+        CANNY_LOW,
+        CANNY_HIGH,
+    )
 
-def create_side_by_side_image(
-    older_image,
-    newer_image,
-    older_document_number,
-    newer_document_number,
-    page_number,
-    comparison_label,
+    kernel = np.ones(
+        (
+            EDGE_DILATION_SIZE,
+            EDGE_DILATION_SIZE,
+        ),
+        dtype=np.uint8,
+    )
+
+    edges = cv2.dilate(
+        edges,
+        kernel,
+        iterations=1,
+    )
+
+    return edges
+
+
+def dice_similarity(
+    older_edges,
+    newer_edges,
 ):
     """
-    Create one inspection PNG containing:
+    Compare two binary structural edge maps.
 
-    OLD PDF | NEW PDF
+    1.0 = structurally identical
+    0.0 = no structural overlap
     """
-    target_height = max(
-        older_image.height,
-        newer_image.height,
+    older_mask = (
+        older_edges > 0
     )
 
-    older_image = fit_image_to_height(
-        older_image,
-        target_height,
+    newer_mask = (
+        newer_edges > 0
     )
 
-    newer_image = fit_image_to_height(
-        newer_image,
-        target_height,
+    older_count = np.count_nonzero(
+        older_mask
     )
 
-    outer_margin = 30
-    gap = 30
-    header_height = 90
-    footer_height = 45
-
-    canvas_width = (
-        outer_margin
-        + older_image.width
-        + gap
-        + newer_image.width
-        + outer_margin
+    newer_count = np.count_nonzero(
+        newer_mask
     )
 
-    canvas_height = (
-        header_height
-        + target_height
-        + footer_height
+    if (
+        older_count == 0
+        and newer_count == 0
+    ):
+        return 1.0
+
+    denominator = (
+        older_count
+        + newer_count
     )
 
-    canvas = Image.new(
-        "RGB",
+    if denominator == 0:
+        return 0.0
+
+    intersection = np.count_nonzero(
+        older_mask
+        & newer_mask
+    )
+
+    score = (
+        2.0
+        * intersection
+        / denominator
+    )
+
+    return float(
+        score
+    )
+
+
+def compare_page(
+    older_page,
+    newer_page,
+):
+    """
+    Render and structurally compare one page pair.
+    """
+    older_render = render_page(
+        older_page
+    )
+
+    newer_render = render_page(
+        newer_page
+    )
+
+    older_normalized = normalize_page(
+        older_render
+    )
+
+    newer_normalized = normalize_page(
+        newer_render
+    )
+
+    older_edges = create_edge_map(
+        older_normalized
+    )
+
+    newer_edges = create_edge_map(
+        newer_normalized
+    )
+
+    similarity = dice_similarity(
+        older_edges,
+        newer_edges,
+    )
+
+    return {
+        "similarity": similarity,
+        "older_normalized":
+            older_normalized,
+        "newer_normalized":
+            newer_normalized,
+        "older_edges":
+            older_edges,
+        "newer_edges":
+            newer_edges,
+    }
+
+
+def add_label(
+    image,
+    text,
+):
+    """
+    Add a title bar above one grayscale diagnostic image.
+    """
+    if len(image.shape) == 2:
+        display = cv2.cvtColor(
+            image,
+            cv2.COLOR_GRAY2BGR,
+        )
+    else:
+        display = image.copy()
+
+    header_height = 38
+
+    canvas = np.full(
         (
-            canvas_width,
-            canvas_height,
+            display.shape[0]
+            + header_height,
+            display.shape[1],
+            3,
         ),
-        "white",
+        255,
+        dtype=np.uint8,
     )
 
-    older_x = outer_margin
+    canvas[
+        header_height:,
+        :,
+    ] = display
 
-    newer_x = (
-        outer_margin
-        + older_image.width
-        + gap
-    )
-
-    image_y = header_height
-
-    canvas.paste(
-        older_image,
+    cv2.putText(
+        canvas,
+        text,
         (
-            older_x,
-            image_y,
+            8,
+            25,
         ),
-    )
-
-    canvas.paste(
-        newer_image,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
         (
-            newer_x,
-            image_y,
-        ),
-    )
-
-    draw = ImageDraw.Draw(
-        canvas
-    )
-
-    font = get_font()
-
-    old_center_x = (
-        older_x
-        + older_image.width // 2
-    )
-
-    new_center_x = (
-        newer_x
-        + newer_image.width // 2
-    )
-
-    draw_centered_text(
-        draw,
-        "OLDER",
-        old_center_x,
-        12,
-        font,
-    )
-
-    draw_centered_text(
-        draw,
-        f"Document {older_document_number}",
-        old_center_x,
-        30,
-        font,
-    )
-
-    draw_centered_text(
-        draw,
-        "NEWER",
-        new_center_x,
-        12,
-        font,
-    )
-
-    draw_centered_text(
-        draw,
-        f"Document {newer_document_number}",
-        new_center_x,
-        30,
-        font,
-    )
-
-    divider_x = (
-        older_x
-        + older_image.width
-        + gap // 2
-    )
-
-    draw.line(
-        (
-            divider_x,
             0,
-            divider_x,
-            canvas_height,
+            0,
+            0,
         ),
-        fill="black",
-        width=2,
-    )
-
-    footer_text = (
-        f"{comparison_label} | "
-        f"PDF page {page_number}"
-    )
-
-    draw_centered_text(
-        draw,
-        footer_text,
-        canvas_width // 2,
-        canvas_height - 28,
-        font,
+        1,
+        cv2.LINE_AA,
     )
 
     return canvas
 
 
-def save_comparison_image(
-    comparison,
+def save_diagnostic_image(
+    control,
     page_number,
-    older_pdf,
-    newer_pdf,
+    result,
 ):
     """
-    Render and save one old/new side-by-side comparison.
+    Save a four-panel diagnostic image:
+
+    OLD PAGE | NEW PAGE | OLD EDGES | NEW EDGES
     """
-    older_document_number = (
-        comparison[
-            "older_document"
+    older_page_panel = add_label(
+        result[
+            "older_normalized"
+        ],
+        "OLDER PAGE",
+    )
+
+    newer_page_panel = add_label(
+        result[
+            "newer_normalized"
+        ],
+        "NEWER PAGE",
+    )
+
+    older_edges_panel = add_label(
+        result[
+            "older_edges"
+        ],
+        "OLDER EDGES",
+    )
+
+    newer_edges_panel = add_label(
+        result[
+            "newer_edges"
+        ],
+        "NEWER EDGES",
+    )
+
+    combined = cv2.hconcat(
+        [
+            older_page_panel,
+            newer_page_panel,
+            older_edges_panel,
+            newer_edges_panel,
         ]
     )
 
-    newer_document_number = (
-        comparison[
-            "newer_document"
-        ]
+    footer_height = 45
+
+    final_image = np.full(
+        (
+            combined.shape[0]
+            + footer_height,
+            combined.shape[1],
+            3,
+        ),
+        255,
+        dtype=np.uint8,
     )
 
-    print(
-        f"  Rendering page "
-        f"{page_number}..."
+    final_image[
+        :combined.shape[0],
+        :,
+    ] = combined
+
+    footer_text = (
+        f'{control["label"]} | '
+        f'page {page_number} | '
+        f'structural similarity '
+        f'{result["similarity"]:.4f}'
     )
 
-    older_image = render_page(
-        older_pdf,
-        page_number,
-    )
-
-    newer_image = render_page(
-        newer_pdf,
-        page_number,
-    )
-
-    comparison_image = (
-        create_side_by_side_image(
-            older_image=older_image,
-            newer_image=newer_image,
-            older_document_number=(
-                older_document_number
-            ),
-            newer_document_number=(
-                newer_document_number
-            ),
-            page_number=page_number,
-            comparison_label=(
-                comparison["label"]
-            ),
-        )
+    cv2.putText(
+        final_image,
+        footer_text,
+        (
+            12,
+            combined.shape[0] + 29,
+        ),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (
+            0,
+            0,
+            0,
+        ),
+        1,
+        cv2.LINE_AA,
     )
 
     filename = (
-        f'{TEST_SET_NUM}_'
-        f'{comparison["booklet"]}_'
-        f'page_{page_number:03d}_'
-        f'{older_document_number}_vs_'
-        f'{newer_document_number}.png'
+        f'{control["name"]}_'
+        f'page_{page_number:04d}.png'
     )
 
     output_path = (
@@ -548,77 +644,102 @@ def save_comparison_image(
         / filename
     )
 
-    comparison_image.save(
-        output_path,
-        format="PNG",
-        optimize=True,
+    cv2.imwrite(
+        str(output_path),
+        final_image,
     )
 
     print(
-        f"    Saved: "
+        f"    Saved diagnostic: "
         f"{output_path}"
     )
 
-    return output_path
 
-
-def process_comparison(
-    comparison,
-    documents,
-    pdf_byte_cache,
+def print_score_distribution(
+    scores,
 ):
     """
-    Generate all requested inspection images for one booklet pair.
+    Print useful percentile values so we can compare controls.
     """
-    older_number = (
-        comparison[
-            "older_document"
-        ]
+    values = np.array(
+        scores,
+        dtype=float,
     )
 
-    newer_number = (
-        comparison[
-            "newer_document"
-        ]
+    print("")
+    print(
+        "Structural similarity distribution:"
     )
 
+    print(
+        f"  Mean: "
+        f"{np.mean(values):.4f}"
+    )
+
+    print(
+        f"  Median: "
+        f"{np.median(values):.4f}"
+    )
+
+    print(
+        f"  10th percentile: "
+        f"{np.percentile(values, 10):.4f}"
+    )
+
+    print(
+        f"  25th percentile: "
+        f"{np.percentile(values, 25):.4f}"
+    )
+
+    print(
+        f"  75th percentile: "
+        f"{np.percentile(values, 75):.4f}"
+    )
+
+    print(
+        f"  90th percentile: "
+        f"{np.percentile(values, 90):.4f}"
+    )
+
+    print(
+        f"  Minimum: "
+        f"{np.min(values):.4f}"
+    )
+
+    print(
+        f"  Maximum: "
+        f"{np.max(values):.4f}"
+    )
+
+
+def process_control(
+    control,
+):
+    """
+    Compare all same-position pages for one control pair.
+    """
     print("")
     print("=" * 72)
 
     print(
-        comparison["label"]
-    )
-
-    print(
-        f"{older_number} -> "
-        f"{newer_number}"
+        control["label"]
     )
 
     print("=" * 72)
 
-    older_document = (
-        documents.get(
-            older_number
-        )
+    older_document = get_document(
+        control["set_num"],
+        control[
+            "older_document"
+        ],
     )
 
-    newer_document = (
-        documents.get(
-            newer_number
-        )
+    newer_document = get_document(
+        control["set_num"],
+        control[
+            "newer_document"
+        ],
     )
-
-    if not older_document:
-        raise RuntimeError(
-            f"Missing metadata for "
-            f"{older_number}."
-        )
-
-    if not newer_document:
-        raise RuntimeError(
-            f"Missing metadata for "
-            f"{newer_number}."
-        )
 
     print(
         "Older description: "
@@ -638,62 +759,193 @@ def process_comparison(
         )
     )
 
-    if older_number not in pdf_byte_cache:
-        pdf_byte_cache[
-            older_number
-        ] = download_pdf(
-            older_document
-        )
+    older_bytes = download_pdf(
+        older_document
+    )
 
-    if newer_number not in pdf_byte_cache:
-        pdf_byte_cache[
-            newer_number
-        ] = download_pdf(
-            newer_document
-        )
+    newer_bytes = download_pdf(
+        newer_document
+    )
 
     older_pdf = open_pdf(
-        pdf_byte_cache[
-            older_number
-        ]
+        older_bytes
     )
 
     newer_pdf = open_pdf(
-        pdf_byte_cache[
-            newer_number
-        ]
+        newer_bytes
     )
 
     try:
+        older_page_count = len(
+            older_pdf
+        )
+
+        newer_page_count = len(
+            newer_pdf
+        )
+
+        shared_page_count = min(
+            older_page_count,
+            newer_page_count,
+        )
+
+        print("")
         print(
-            f"Older pages: "
-            f"{len(older_pdf)}"
+            f"Older page count: "
+            f"{older_page_count}"
         )
 
         print(
-            f"Newer pages: "
-            f"{len(newer_pdf)}"
+            f"Newer page count: "
+            f"{newer_page_count}"
         )
 
-        generated_paths = []
+        print(
+            f"Same-position pages compared: "
+            f"{shared_page_count}"
+        )
 
-        for page_number in (
-            comparison["pages"]
+        print("")
+        print(
+            "Comparing structural edge geometry..."
+        )
+
+        page_results = []
+
+        for index in range(
+            shared_page_count
         ):
-            output_path = (
-                save_comparison_image(
-                    comparison=comparison,
-                    page_number=page_number,
-                    older_pdf=older_pdf,
-                    newer_pdf=newer_pdf,
+            page_number = (
+                index + 1
+            )
+
+            result = compare_page(
+                older_pdf[index],
+                newer_pdf[index],
+            )
+
+            page_results.append({
+                "page_number":
+                    page_number,
+                "similarity":
+                    result[
+                        "similarity"
+                    ],
+            })
+
+            if (
+                page_number == 1
+                or page_number
+                % 50 == 0
+                or page_number
+                == shared_page_count
+            ):
+                print(
+                    f"  Processed page "
+                    f"{page_number}/"
+                    f"{shared_page_count}"
                 )
+
+        scores = [
+            page[
+                "similarity"
+            ]
+            for page
+            in page_results
+        ]
+
+        print_score_distribution(
+            scores
+        )
+
+        sorted_results = sorted(
+            page_results,
+            key=lambda item:
+            item["similarity"],
+        )
+
+        print("")
+        print(
+            "Lowest structural-similarity pages:"
+        )
+
+        for item in sorted_results[
+            :20
+        ]:
+            print(
+                f'  Page '
+                f'{item["page_number"]}: '
+                f'{item["similarity"]:.4f}'
             )
 
-            generated_paths.append(
-                output_path
+        print("")
+        print(
+            f"Generating diagnostics for "
+            f"the lowest "
+            f"{LOWEST_PAGES_TO_SAVE} "
+            f"pages..."
+        )
+
+        for item in sorted_results[
+            :LOWEST_PAGES_TO_SAVE
+        ]:
+            page_number = (
+                item[
+                    "page_number"
+                ]
             )
 
-        return generated_paths
+            detailed_result = compare_page(
+                older_pdf[
+                    page_number - 1
+                ],
+                newer_pdf[
+                    page_number - 1
+                ],
+            )
+
+            save_diagnostic_image(
+                control,
+                page_number,
+                detailed_result,
+            )
+
+        if (
+            older_page_count
+            != newer_page_count
+        ):
+            print("")
+            print(
+                "NOTE: The PDFs have "
+                "different page counts."
+            )
+
+            print(
+                "Same-page-number comparison "
+                "cannot account for page insertion "
+                "or deletion yet."
+            )
+
+        return {
+            "control":
+                control["name"],
+            "page_count_old":
+                older_page_count,
+            "page_count_new":
+                newer_page_count,
+            "mean_similarity":
+                float(
+                    np.mean(scores)
+                ),
+            "median_similarity":
+                float(
+                    np.median(scores)
+                ),
+            "minimum_similarity":
+                float(
+                    np.min(scores)
+                ),
+        }
 
     finally:
         older_pdf.close()
@@ -703,15 +955,11 @@ def process_comparison(
 def main():
     print("")
     print(
-        "BrickTrip LEGO Instruction Visual Inspection"
-    )
-    print(
-        "============================================"
+        "BrickTrip Structural Instruction Comparison"
     )
 
     print(
-        f"Controlled test set: "
-        f"{TEST_SET_NUM}"
+        "==========================================="
     )
 
     print(
@@ -723,33 +971,19 @@ def main():
         exist_ok=True,
     )
 
-    documents = (
-        get_instruction_documents()
-    )
-
-    print("")
-    print(
-        f"Required instruction documents found: "
-        f"{len(documents)}"
-    )
-
-    pdf_byte_cache = {}
-
-    generated_files = []
+    summaries = []
 
     succeeded = 0
     failed = 0
 
-    for comparison in COMPARISONS:
+    for control in CONTROLS:
         try:
-            paths = process_comparison(
-                comparison=comparison,
-                documents=documents,
-                pdf_byte_cache=pdf_byte_cache,
+            summary = process_control(
+                control
             )
 
-            generated_files.extend(
-                paths
+            summaries.append(
+                summary
             )
 
             succeeded += 1
@@ -760,42 +994,62 @@ def main():
             print("")
             print(
                 f"ERROR processing "
-                f'{comparison["label"]}: '
+                f'{control["label"]}: '
                 f"{error}"
             )
 
     print("")
     print("=" * 72)
-    print(
-        "VISUAL INSPECTION TEST COMPLETE"
-    )
 
     print(
-        f"Booklet comparisons succeeded: "
+        "CONTROL COMPARISON SUMMARY"
+    )
+
+    print("=" * 72)
+
+    for summary in summaries:
+        print("")
+
+        print(
+            summary["control"]
+        )
+
+        print(
+            f'  Old pages: '
+            f'{summary["page_count_old"]}'
+        )
+
+        print(
+            f'  New pages: '
+            f'{summary["page_count_new"]}'
+        )
+
+        print(
+            f'  Mean structural similarity: '
+            f'{summary["mean_similarity"]:.4f}'
+        )
+
+        print(
+            f'  Median structural similarity: '
+            f'{summary["median_similarity"]:.4f}'
+        )
+
+        print(
+            f'  Lowest page similarity: '
+            f'{summary["minimum_similarity"]:.4f}'
+        )
+
+    print("")
+    print(
+        f"Controls succeeded: "
         f"{succeeded}"
     )
 
     print(
-        f"Booklet comparisons failed: "
+        f"Controls failed: "
         f"{failed}"
     )
 
-    print(
-        f"PNG files generated: "
-        f"{len(generated_files)}"
-    )
-
-    print("")
-    print(
-        "Generated files:"
-    )
-
-    for path in generated_files:
-        print(
-            f"  {path}"
-        )
-
-    print("")
     print(
         "Database writes: 0"
     )
