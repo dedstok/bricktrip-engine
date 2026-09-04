@@ -3,3 +3,4 @@ requests
 pypdf
 pymupdf
 Pillow
+opencv-python-headless
