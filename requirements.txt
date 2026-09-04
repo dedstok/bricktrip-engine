@@ -1,3 +1,4 @@
 supabase
 requests
 pypdf
+pymupdf
