@@ -1,4 +1,7 @@
 import os
+import re
+from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 
 import cv2
@@ -17,50 +20,60 @@ supabase = create_client(
 )
 
 
-# ------------------------------------------------------------
-# READ-ONLY PAGE-SEQUENCE ALIGNMENT TEST
-# ------------------------------------------------------------
+# ============================================================
+# BRICKTRIP INTEGRATED REVISION DIAGNOSTIC
+# ============================================================
 #
-# Known positive control:
-#   LEGO 42129-1
+# READ ONLY.
 #
-# Older PDF:
-#   6396686
+# This controlled worker combines:
 #
-# Revised PDF:
-#   6411661
+# SET
+# -> instruction history
+# -> booklet identity
+# -> publication generations
+# -> official LEGO PDF pairs
+# -> normalized structural comparison
+# -> page-sequence alignment
+# -> provisional revision classification
 #
-# This worker:
-# - downloads both official LEGO PDFs
-# - renders every page once
-# - creates structural edge maps
-# - aligns the two page sequences
-# - allows page insertions/deletions
-# - identifies genuinely low-similarity aligned pages
+# It DOES NOT:
+# - insert evidence
+# - update revision_candidates
+# - create revisions
+# - modify Supabase
 #
-# NOTHING is written to Supabase.
-# ------------------------------------------------------------
+# ============================================================
 
 
-TEST_SET_NUM = "42129-1"
-
-OLDER_DOCUMENT = "6396686"
-
-NEWER_DOCUMENT = "6411661"
+TEST_SET_NUMBERS = [
+    "42171-1",
+    "42129-1",
+    "60004-1",
+    "60085-1",
+    "10194-1",
+    "10214-1",
+    "31058-1",
+]
 
 
 OUTPUT_DIR = Path(
     "artifacts/bricktrip_pdf_comparisons"
 )
 
+SUMMARY_FILE = (
+    OUTPUT_DIR
+    / "integrated_revision_diagnostic.txt"
+)
 
-# ------------------------------------------------------------
-# IMAGE / STRUCTURAL SETTINGS
-# ------------------------------------------------------------
 
-RENDER_SCALE = 0.40
+# ============================================================
+# IMAGE SETTINGS
+# ============================================================
 
-NORMALIZED_SIZE = 360
+RENDER_SCALE = 0.35
+
+NORMALIZED_SIZE = 320
 
 WHITE_THRESHOLD = 245
 
@@ -73,57 +86,302 @@ CANNY_HIGH = 140
 EDGE_DILATION_SIZE = 3
 
 
-# ------------------------------------------------------------
+# ============================================================
 # ALIGNMENT SETTINGS
-# ------------------------------------------------------------
+# ============================================================
 
-# We already know this pair differs by only four PDF pages.
-#
-# A 12-page search window gives the aligner enough room to recover
-# from insertions while keeping the computation reasonable.
 ALIGNMENT_BAND = 12
 
-
-# Similarity is between 0 and 1.
-#
-# We subtract this baseline before using a page match in the
-# sequence alignment.
-#
-# Example:
-#
-# similarity 0.95 -> +0.45
-# similarity 0.80 -> +0.30
-# similarity 0.50 ->  0.00
-# similarity 0.20 -> -0.30
-#
 MATCH_BASELINE = 0.50
 
-
-# Penalty for inserting/deleting one PDF page.
-#
-# This lets the aligner prefer:
-#
-#   skip one unrelated inserted page
-#
-# instead of:
-#
-#   incorrectly compare every later page to the wrong page.
-#
 GAP_PENALTY = -0.18
 
 
-# Number of lowest-similarity ALIGNED page pairs to save.
-LOWEST_PAIRS_TO_SAVE = 15
+# ============================================================
+# CLASSIFICATION SETTINGS
+# ============================================================
+#
+# These are provisional diagnostic thresholds.
+#
+# We are testing whether the seven benchmark sets behave
+# sensibly before any database-writing worker is restored.
+# ============================================================
+
+REPRINT_MEDIAN_MIN = 0.80
+
+REPRINT_P10_MIN = 0.70
+
+REPRINT_MINIMUM_MIN = 0.35
+
+REVISION_VERY_LOW = 0.30
+
+REVISION_LOW = 0.60
 
 
-def get_document(document_number):
+def log(message=""):
     """
-    Fetch one instruction-document record.
+    Print to GitHub log and save the same text to our artifact.
+    """
+    text = str(message)
+
+    print(text)
+
+    with SUMMARY_FILE.open(
+        "a",
+        encoding="utf-8",
+    ) as handle:
+        handle.write(
+            text + "\n"
+        )
+
+
+def parse_date(value):
+    """
+    Parse Supabase timestamp.
+    """
+    if not value:
+        return None
+
+    try:
+        return datetime.fromisoformat(
+            value.replace(
+                "Z",
+                "+00:00",
+            )
+        )
+
+    except ValueError:
+        return None
+
+
+def effective_date(document):
+    """
+    Prefer source modification date.
+
+    Fall back to date added.
+    """
+    modified = parse_date(
+        document.get(
+            "source_date_modified"
+        )
+    )
+
+    if modified:
+        return modified
+
+    added = parse_date(
+        document.get(
+            "source_date_added"
+        )
+    )
+
+    if added:
+        return added
+
+    return None
+
+
+def date_key(document):
+    """
+    Calendar-date publication key.
+    """
+    value = effective_date(
+        document
+    )
+
+    if not value:
+        return None
+
+    return value.date().isoformat()
+
+
+def document_sort_key(document):
+    """
+    Safe chronological sorting.
+    """
+    value = effective_date(
+        document
+    )
+
+    if value:
+        return value
+
+    return datetime.min.replace(
+        tzinfo=timezone.utc
+    )
+
+
+def is_main_instruction(document):
+    """
+    Ignore obvious translation / support / alternate-model PDFs.
+    """
+    description = (
+        document.get(
+            "description"
+        )
+        or ""
+    ).lower()
+
+    source_url = (
+        document.get(
+            "source_url"
+        )
+        or ""
+    ).lower()
+
+    ignored_terms = [
+        "translate",
+        "translation",
+        "additional.main",
+        "additional.extra",
+    ]
+
+    for term in ignored_terms:
+        if (
+            term in description
+            or term in source_url
+        ):
+            return False
+
+    return True
+
+
+def parse_versions(description):
+    """
+    Parse LEGO regional/version labels.
+
+    Handles:
+
+    V29
+    V29/V118
+    V46/39
+    """
+    if not description:
+        return tuple()
+
+    text = description.upper()
+
+    versions = []
+
+    matches = re.findall(
+        r"\bV(\d+)(?:\s*/\s*(\d+))?",
+        text,
+    )
+
+    for first, second in matches:
+
+        first_label = (
+            f"V{first}"
+        )
+
+        if first_label not in versions:
+            versions.append(
+                first_label
+            )
+
+        if second:
+
+            second_label = (
+                f"V{second}"
+            )
+
+            if (
+                second_label
+                not in versions
+            ):
+                versions.append(
+                    second_label
+                )
+
+    return tuple(
+        versions
+    )
+
+
+def parse_booklet_slot(description):
+    """
+    Parse physical instruction booklet identity.
+
+    Examples:
+
+    1/2
+    2/3
+    BOOK 1/3
+    BOOK2/3
+
+    Large BI/page-printing fractions are rejected.
+    """
+    if not description:
+        return None
+
+    text = description.upper()
+
+    candidates = []
+
+    matches = re.finditer(
+        r"(?<!\d)"
+        r"(\d{1,2})"
+        r"\s*/\s*"
+        r"(\d{1,2})"
+        r"(?!\d)",
+        text,
+    )
+
+    for match in matches:
+
+        numerator = int(
+            match.group(1)
+        )
+
+        denominator = int(
+            match.group(2)
+        )
+
+        if numerator < 1:
+            continue
+
+        if denominator < 2:
+            continue
+
+        if denominator > 20:
+            continue
+
+        if numerator > denominator:
+            continue
+
+        candidates.append(
+            (
+                numerator,
+                denominator,
+            )
+        )
+
+    if not candidates:
+        return None
+
+    numerator, denominator = (
+        candidates[-1]
+    )
+
+    return (
+        f"{numerator}/"
+        f"{denominator}"
+    )
+
+
+def get_instruction_documents(
+    set_num,
+):
+    """
+    Fetch instruction metadata for one set.
     """
     response = (
         supabase
-        .table("instruction_documents")
+        .table(
+            "instruction_documents"
+        )
         .select(
+            "id,"
             "set_num,"
             "document_number,"
             "description,"
@@ -133,35 +391,349 @@ def get_document(document_number):
         )
         .eq(
             "set_num",
-            TEST_SET_NUM,
+            set_num,
         )
-        .eq(
-            "document_number",
-            document_number,
-        )
-        .limit(1)
         .execute()
     )
 
-    rows = response.data or []
+    documents = (
+        response.data
+        or []
+    )
 
-    if not rows:
-        raise RuntimeError(
-            f"Instruction document "
-            f"{document_number} "
-            f"was not found."
+    documents.sort(
+        key=document_sort_key
+    )
+
+    return documents
+
+
+def publication_generations(
+    documents,
+):
+    """
+    Group documents sharing one effective publication date.
+    """
+    grouped = defaultdict(
+        list
+    )
+
+    for document in documents:
+
+        key = date_key(
+            document
         )
 
-    return rows[0]
+        if key is None:
+            continue
+
+        grouped[
+            key
+        ].append(
+            document
+        )
+
+    generations = []
+
+    for key, docs in (
+        grouped.items()
+    ):
+
+        docs.sort(
+            key=lambda document:
+            str(
+                document.get(
+                    "document_number"
+                )
+                or ""
+            )
+        )
+
+        generations.append({
+            "date": key,
+            "documents": docs,
+        })
+
+    generations.sort(
+        key=lambda item:
+        item["date"]
+    )
+
+    return generations
 
 
-def download_pdf(document):
+def representative_document(
+    generation,
+):
     """
-    Download one official LEGO PDF.
+    Pick one deterministic regional PDF from a publication group.
+    """
+    documents = (
+        generation[
+            "documents"
+        ]
+    )
+
+    if not documents:
+        return None
+
+    return sorted(
+        documents,
+        key=lambda document:
+        str(
+            document.get(
+                "document_number"
+            )
+            or ""
+        ),
+    )[0]
+
+
+def build_metadata_pairs(
+    documents,
+):
+    """
+    Determine old/new PDFs that are actually comparable.
+
+    Multi-booklet sets:
+        compare 1/3 only with later 1/3, etc.
+
+    No-slot sets:
+        compare repeated V-label lineages.
+    """
+    primary = [
+        document
+        for document
+        in documents
+        if is_main_instruction(
+            document
+        )
+    ]
+
+    booklet_groups = (
+        defaultdict(
+            list
+        )
+    )
+
+    no_slot_documents = []
+
+    for document in primary:
+
+        slot = parse_booklet_slot(
+            document.get(
+                "description"
+            )
+        )
+
+        if slot:
+
+            booklet_groups[
+                slot
+            ].append(
+                document
+            )
+
+        else:
+
+            no_slot_documents.append(
+                document
+            )
+
+    pairs = []
+
+    # --------------------------------------------------------
+    # MULTI-BOOKLET SETS
+    # --------------------------------------------------------
+
+    if booklet_groups:
+
+        for slot, slot_documents in sorted(
+            booklet_groups.items()
+        ):
+
+            generations = (
+                publication_generations(
+                    slot_documents
+                )
+            )
+
+            for index in range(
+                len(generations) - 1
+            ):
+
+                older_generation = (
+                    generations[
+                        index
+                    ]
+                )
+
+                newer_generation = (
+                    generations[
+                        index + 1
+                    ]
+                )
+
+                older_document = (
+                    representative_document(
+                        older_generation
+                    )
+                )
+
+                newer_document = (
+                    representative_document(
+                        newer_generation
+                    )
+                )
+
+                if (
+                    older_document
+                    and newer_document
+                ):
+                    pairs.append({
+                        "identity":
+                            f"booklet {slot}",
+                        "older_generation":
+                            older_generation,
+                        "newer_generation":
+                            newer_generation,
+                        "older_document":
+                            older_document,
+                        "newer_document":
+                            newer_document,
+                    })
+
+        return pairs
+
+    # --------------------------------------------------------
+    # SINGLE BOOKLET / NO SLOT
+    # --------------------------------------------------------
+
+    version_groups = (
+        defaultdict(
+            list
+        )
+    )
+
+    for document in no_slot_documents:
+
+        versions = parse_versions(
+            document.get(
+                "description"
+            )
+        )
+
+        for version in versions:
+
+            version_groups[
+                version
+            ].append(
+                document
+            )
+
+    seen_pairs = set()
+
+    for version, version_documents in sorted(
+        version_groups.items()
+    ):
+
+        generations = (
+            publication_generations(
+                version_documents
+            )
+        )
+
+        for index in range(
+            len(generations) - 1
+        ):
+
+            older_generation = (
+                generations[
+                    index
+                ]
+            )
+
+            newer_generation = (
+                generations[
+                    index + 1
+                ]
+            )
+
+            older_document = (
+                representative_document(
+                    older_generation
+                )
+            )
+
+            newer_document = (
+                representative_document(
+                    newer_generation
+                )
+            )
+
+            if (
+                not older_document
+                or not newer_document
+            ):
+                continue
+
+            older_number = str(
+                older_document.get(
+                    "document_number"
+                )
+            )
+
+            newer_number = str(
+                newer_document.get(
+                    "document_number"
+                )
+            )
+
+            pair_key = (
+                older_number,
+                newer_number,
+            )
+
+            if pair_key in seen_pairs:
+                continue
+
+            seen_pairs.add(
+                pair_key
+            )
+
+            pairs.append({
+                "identity":
+                    f"version {version}",
+                "older_generation":
+                    older_generation,
+                "newer_generation":
+                    newer_generation,
+                "older_document":
+                    older_document,
+                "newer_document":
+                    newer_document,
+            })
+
+    return pairs
+
+
+def download_pdf(
+    document,
+    cache,
+):
+    """
+    Download official LEGO PDF with in-run caching.
     """
     document_number = str(
-        document["document_number"]
+        document.get(
+            "document_number"
+        )
     )
+
+    if document_number in cache:
+        return cache[
+            document_number
+        ]
 
     source_url = document.get(
         "source_url"
@@ -169,12 +741,14 @@ def download_pdf(document):
 
     if not source_url:
         raise RuntimeError(
-            f"Document {document_number} "
+            f"Document "
+            f"{document_number} "
             f"has no source_url."
         )
 
-    print(
-        f"Downloading {document_number}..."
+    log(
+        f"    Downloading "
+        f"{document_number}..."
     )
 
     response = requests.get(
@@ -184,27 +758,36 @@ def download_pdf(document):
 
     response.raise_for_status()
 
-    pdf_bytes = response.content
+    pdf_bytes = (
+        response.content
+    )
 
     if not pdf_bytes.startswith(
         b"%PDF"
     ):
         raise RuntimeError(
-            f"Document {document_number} "
-            f"did not download as a PDF."
+            f"Document "
+            f"{document_number} "
+            f"did not download as PDF."
         )
 
-    print(
-        f"  Downloaded "
+    log(
+        f"      "
         f"{len(pdf_bytes):,} bytes"
     )
+
+    cache[
+        document_number
+    ] = pdf_bytes
 
     return pdf_bytes
 
 
-def open_pdf(pdf_bytes):
+def open_pdf(
+    pdf_bytes,
+):
     """
-    Open PDF bytes using PyMuPDF.
+    Open bytes with PyMuPDF.
     """
     return pymupdf.open(
         stream=pdf_bytes,
@@ -212,9 +795,11 @@ def open_pdf(pdf_bytes):
     )
 
 
-def render_page(page):
+def render_page(
+    page,
+):
     """
-    Render one PDF page to a grayscale numpy image.
+    Render PDF page into grayscale numpy image.
     """
     matrix = pymupdf.Matrix(
         RENDER_SCALE,
@@ -232,29 +817,33 @@ def render_page(page):
         dtype=np.uint8,
     )
 
-    image = image.reshape(
+    return image.reshape(
         pixmap.height,
         pixmap.width,
     )
 
-    return image
 
-
-def find_content_bbox(image):
+def find_content_bbox(
+    image,
+):
     """
-    Find the non-white printed content region.
+    Detect printed area.
     """
     mask = (
-        image < WHITE_THRESHOLD
+        image
+        < WHITE_THRESHOLD
     ).astype(
         np.uint8
     )
 
-    coordinates = cv2.findNonZero(
-        mask
+    coordinates = (
+        cv2.findNonZero(
+            mask
+        )
     )
 
     if coordinates is None:
+
         return (
             0,
             0,
@@ -280,12 +869,14 @@ def find_content_bbox(image):
 
     right = min(
         image.shape[1],
-        x + width + CROP_PADDING,
+        x + width
+        + CROP_PADDING,
     )
 
     bottom = min(
         image.shape[0],
-        y + height + CROP_PADDING,
+        y + height
+        + CROP_PADDING,
     )
 
     return (
@@ -296,9 +887,11 @@ def find_content_bbox(image):
     )
 
 
-def normalize_page(image):
+def normalize_page(
+    image,
+):
     """
-    Crop excess margin and fit the page content into a fixed canvas.
+    Crop margins and normalize page scale.
     """
     (
         left,
@@ -315,6 +908,7 @@ def normalize_page(image):
     ]
 
     if cropped.size == 0:
+
         return np.full(
             (
                 NORMALIZED_SIZE,
@@ -324,8 +918,9 @@ def normalize_page(image):
             dtype=np.uint8,
         )
 
-    available_size = (
-        NORMALIZED_SIZE - 20
+    maximum = (
+        NORMALIZED_SIZE
+        - 20
     )
 
     height, width = (
@@ -333,8 +928,8 @@ def normalize_page(image):
     )
 
     scale = min(
-        available_size / width,
-        available_size / height,
+        maximum / width,
+        maximum / height,
     )
 
     new_width = max(
@@ -387,9 +982,11 @@ def normalize_page(image):
     return canvas
 
 
-def create_edge_map(image):
+def create_edges(
+    image,
+):
     """
-    Convert normalized grayscale page into structural edge geometry.
+    Create color-independent structural representation.
     """
     blurred = cv2.GaussianBlur(
         image,
@@ -414,72 +1011,40 @@ def create_edge_map(image):
         dtype=np.uint8,
     )
 
-    edges = cv2.dilate(
+    return cv2.dilate(
         edges,
         kernel,
         iterations=1,
     )
 
-    return edges
 
-
-def prepare_pdf_pages(pdf, label):
+def prepare_pdf(
+    pdf,
+):
     """
-    Render and prepare every page once.
-
-    Each prepared page stores:
-    - normalized grayscale image
-    - structural edge map
+    Render all pages once.
     """
     prepared = []
 
-    page_count = len(
-        pdf
-    )
-
-    print("")
-    print(
-        f"Preparing {label} PDF..."
-    )
-
-    for index in range(
-        page_count
-    ):
-        page_number = (
-            index + 1
-        )
+    for page in pdf:
 
         rendered = render_page(
-            pdf[index]
+            page
         )
 
-        normalized = normalize_page(
-            rendered
+        normalized = (
+            normalize_page(
+                rendered
+            )
         )
 
-        edges = create_edge_map(
+        edges = create_edges(
             normalized
         )
 
-        prepared.append({
-            "page_number":
-                page_number,
-            "image":
-                normalized,
-            "edges":
-                edges,
-        })
-
-        if (
-            page_number == 1
-            or page_number % 50 == 0
-            or page_number == page_count
-        ):
-            print(
-                f"  Prepared page "
-                f"{page_number}/"
-                f"{page_count}"
-            )
+        prepared.append(
+            edges
+        )
 
     return prepared
 
@@ -489,10 +1054,7 @@ def dice_similarity(
     newer_edges,
 ):
     """
-    Structural Dice similarity.
-
-    1.0 = extremely similar edge geometry.
-    0.0 = no overlap.
+    Structural similarity score.
     """
     older_mask = (
         older_edges > 0
@@ -502,36 +1064,44 @@ def dice_similarity(
         newer_edges > 0
     )
 
-    older_count = np.count_nonzero(
-        older_mask
+    old_count = (
+        np.count_nonzero(
+            older_mask
+        )
     )
 
-    newer_count = np.count_nonzero(
-        newer_mask
+    new_count = (
+        np.count_nonzero(
+            newer_mask
+        )
     )
 
     if (
-        older_count == 0
-        and newer_count == 0
+        old_count == 0
+        and new_count == 0
     ):
         return 1.0
 
     denominator = (
-        older_count
-        + newer_count
+        old_count
+        + new_count
     )
 
     if denominator == 0:
         return 0.0
 
-    intersection = np.count_nonzero(
-        older_mask
-        & newer_mask
+    intersection = (
+        np.count_nonzero(
+            older_mask
+            & newer_mask
+        )
     )
 
     return float(
-        2.0
-        * intersection
+        (
+            2.0
+            * intersection
+        )
         / denominator
     )
 
@@ -541,9 +1111,7 @@ def build_similarity_cache(
     newer_pages,
 ):
     """
-    Precompute structural similarities only inside the alignment band.
-
-    This avoids comparing every old page against every new page.
+    Compare only pages near the expected sequence position.
     """
     cache = {}
 
@@ -555,108 +1123,53 @@ def build_similarity_cache(
         newer_pages
     )
 
-    print("")
-    print(
-        "Building structural similarity window..."
-    )
-
-    comparisons = 0
-
     for old_index in range(
         old_count
     ):
-        expected_new_index = (
-            old_index
-        )
 
-        minimum_new_index = max(
+        minimum = max(
             0,
-            expected_new_index
+            old_index
             - ALIGNMENT_BAND,
         )
 
-        maximum_new_index = min(
+        maximum = min(
             new_count - 1,
-            expected_new_index
+            old_index
             + ALIGNMENT_BAND,
         )
 
         for new_index in range(
-            minimum_new_index,
-            maximum_new_index + 1,
+            minimum,
+            maximum + 1,
         ):
-            similarity = dice_similarity(
-                older_pages[
-                    old_index
-                ]["edges"],
-                newer_pages[
-                    new_index
-                ]["edges"],
-            )
 
             cache[
                 (
                     old_index,
                     new_index,
                 )
-            ] = similarity
-
-            comparisons += 1
-
-        page_number = (
-            old_index + 1
-        )
-
-        if (
-            page_number == 1
-            or page_number % 50 == 0
-            or page_number == old_count
-        ):
-            print(
-                f"  Similarity window "
-                f"through old page "
-                f"{page_number}/"
-                f"{old_count}"
+            ] = dice_similarity(
+                older_pages[
+                    old_index
+                ],
+                newer_pages[
+                    new_index
+                ],
             )
-
-    print(
-        f"Similarity comparisons computed: "
-        f"{comparisons:,}"
-    )
 
     return cache
 
 
-def get_similarity(
-    cache,
-    old_index,
-    new_index,
-):
-    """
-    Return cached similarity.
-
-    Anything outside our alignment window is treated as impossible.
-    """
-    return cache.get(
-        (
-            old_index,
-            new_index,
-        )
-    )
-
-
-def align_page_sequences(
+def align_pages(
     older_pages,
     newer_pages,
     similarity_cache,
 ):
     """
-    Global sequence alignment with page insertion/deletion support.
+    Global page-sequence alignment.
 
-    Operations:
-    M = match old page to new page
-    D = old page has no corresponding new page
-    I = new page was inserted relative to old PDF
+    Allows inserted and removed PDF pages.
     """
     old_count = len(
         older_pages
@@ -666,16 +1179,14 @@ def align_page_sequences(
         newer_pages
     )
 
-    negative_infinity = (
-        -1e12
-    )
+    negative = -1e12
 
     scores = np.full(
         (
             old_count + 1,
             new_count + 1,
         ),
-        negative_infinity,
+        negative,
         dtype=np.float64,
     )
 
@@ -693,75 +1204,76 @@ def align_page_sequences(
         0,
     ] = 0.0
 
-    # Leading deletions.
     for old_position in range(
         1,
-        old_count + 1,
+        min(
+            old_count,
+            ALIGNMENT_BAND,
+        ) + 1,
     ):
-        if old_position <= ALIGNMENT_BAND:
+
+        scores[
+            old_position,
+            0,
+        ] = (
             scores[
-                old_position,
+                old_position - 1,
                 0,
-            ] = (
-                scores[
-                    old_position - 1,
-                    0,
-                ]
-                + GAP_PENALTY
-            )
+            ]
+            + GAP_PENALTY
+        )
 
-            trace[
-                old_position,
-                0,
-            ] = "D"
+        trace[
+            old_position,
+            0,
+        ] = "D"
 
-    # Leading insertions.
     for new_position in range(
         1,
-        new_count + 1,
+        min(
+            new_count,
+            ALIGNMENT_BAND,
+        ) + 1,
     ):
-        if new_position <= ALIGNMENT_BAND:
+
+        scores[
+            0,
+            new_position,
+        ] = (
             scores[
                 0,
-                new_position,
-            ] = (
-                scores[
-                    0,
-                    new_position - 1,
-                ]
-                + GAP_PENALTY
-            )
+                new_position - 1,
+            ]
+            + GAP_PENALTY
+        )
 
-            trace[
-                0,
-                new_position,
-            ] = "I"
-
-    print("")
-    print(
-        "Aligning PDF page sequences..."
-    )
+        trace[
+            0,
+            new_position,
+        ] = "I"
 
     for old_position in range(
         1,
         old_count + 1,
     ):
-        minimum_new_position = max(
+
+        minimum_new = max(
             1,
             old_position
             - ALIGNMENT_BAND,
         )
 
-        maximum_new_position = min(
+        maximum_new = min(
             new_count,
             old_position
             + ALIGNMENT_BAND,
         )
 
         for new_position in range(
-            minimum_new_position,
-            maximum_new_position + 1,
+            minimum_new,
+            maximum_new + 1,
         ):
+
             old_index = (
                 old_position - 1
             )
@@ -770,25 +1282,28 @@ def align_page_sequences(
                 new_position - 1
             )
 
-            similarity = get_similarity(
-                similarity_cache,
-                old_index,
-                new_index,
+            similarity = (
+                similarity_cache.get(
+                    (
+                        old_index,
+                        new_index,
+                    )
+                )
             )
 
             match_score = (
-                negative_infinity
+                negative
             )
 
             if similarity is not None:
+
                 previous = scores[
                     old_position - 1,
                     new_position - 1,
                 ]
 
-                if (
-                    previous
-                    > negative_infinity / 2
+                if previous > (
+                    negative / 2
                 ):
                     match_score = (
                         previous
@@ -812,7 +1327,7 @@ def align_page_sequences(
                 + GAP_PENALTY
             )
 
-            best_score = max(
+            best = max(
                 match_score,
                 delete_score,
                 insert_score,
@@ -821,15 +1336,15 @@ def align_page_sequences(
             scores[
                 old_position,
                 new_position,
-            ] = best_score
+            ] = best
 
-            if best_score == match_score:
+            if best == match_score:
                 trace[
                     old_position,
                     new_position,
                 ] = "M"
 
-            elif best_score == delete_score:
+            elif best == delete_score:
                 trace[
                     old_position,
                     new_position,
@@ -840,17 +1355,6 @@ def align_page_sequences(
                     old_position,
                     new_position,
                 ] = "I"
-
-        if (
-            old_position == 1
-            or old_position % 50 == 0
-            or old_position == old_count
-        ):
-            print(
-                f"  Aligned through old page "
-                f"{old_position}/"
-                f"{old_count}"
-            )
 
     old_position = (
         old_count
@@ -866,28 +1370,26 @@ def align_page_sequences(
         old_position > 0
         or new_position > 0
     ):
+
         operation = trace[
             old_position,
             new_position,
         ]
 
         if operation == "M":
-            old_index = (
-                old_position - 1
-            )
 
-            new_index = (
-                new_position - 1
-            )
-
-            similarity = get_similarity(
-                similarity_cache,
-                old_index,
-                new_index,
+            similarity = (
+                similarity_cache[
+                    (
+                        old_position - 1,
+                        new_position - 1,
+                    )
+                ]
             )
 
             alignment.append({
-                "operation": "match",
+                "operation":
+                    "match",
                 "old_page":
                     old_position,
                 "new_page":
@@ -900,8 +1402,10 @@ def align_page_sequences(
             new_position -= 1
 
         elif operation == "D":
+
             alignment.append({
-                "operation": "delete",
+                "operation":
+                    "delete",
                 "old_page":
                     old_position,
                 "new_page":
@@ -913,8 +1417,10 @@ def align_page_sequences(
             old_position -= 1
 
         elif operation == "I":
+
             alignment.append({
-                "operation": "insert",
+                "operation":
+                    "insert",
                 "old_page":
                     None,
                 "new_page":
@@ -926,10 +1432,10 @@ def align_page_sequences(
             new_position -= 1
 
         else:
+
             raise RuntimeError(
-                "Sequence alignment traceback "
-                f"failed at old={old_position}, "
-                f"new={new_position}."
+                "Page alignment "
+                "traceback failed."
             )
 
     alignment.reverse()
@@ -937,443 +1443,45 @@ def align_page_sequences(
     return alignment
 
 
-def summarize_alignment(
-    alignment,
+def analyze_pdf_pair(
+    pair,
+    pdf_cache,
 ):
     """
-    Print the discovered page correspondence and offset changes.
+    Perform structural aligned comparison of one old/new PDF pair.
     """
-    matches = [
-        item
-        for item in alignment
-        if item["operation"]
-        == "match"
-    ]
-
-    insertions = [
-        item
-        for item in alignment
-        if item["operation"]
-        == "insert"
-    ]
-
-    deletions = [
-        item
-        for item in alignment
-        if item["operation"]
-        == "delete"
-    ]
-
-    print("")
-    print("=" * 72)
-    print(
-        "PAGE ALIGNMENT RESULT"
-    )
-    print("=" * 72)
-
-    print(
-        f"Matched page pairs: "
-        f"{len(matches)}"
-    )
-
-    print(
-        f"Pages inserted in newer PDF: "
-        f"{len(insertions)}"
-    )
-
-    print(
-        f"Pages present only in older PDF: "
-        f"{len(deletions)}"
-    )
-
-    if insertions:
-        print("")
-        print(
-            "Inserted newer pages:"
-        )
-
-        for item in insertions:
-            print(
-                f'  New page '
-                f'{item["new_page"]}'
-            )
-
-    if deletions:
-        print("")
-        print(
-            "Older-only pages:"
-        )
-
-        for item in deletions:
-            print(
-                f'  Old page '
-                f'{item["old_page"]}'
-            )
-
-    print("")
-    print(
-        "Page-offset transitions:"
-    )
-
-    previous_offset = None
-
-    transition_count = 0
-
-    for item in matches:
-        old_page = item[
-            "old_page"
-        ]
-
-        new_page = item[
-            "new_page"
-        ]
-
-        offset = (
-            new_page
-            - old_page
-        )
-
-        if (
-            previous_offset is None
-            or offset
-            != previous_offset
-        ):
-            print(
-                f"  Starting at old page "
-                f"{old_page}: "
-                f"old {old_page} -> "
-                f"new {new_page} "
-                f"(offset {offset:+d})"
-            )
-
-            previous_offset = (
-                offset
-            )
-
-            transition_count += 1
-
-    print(
-        f"Offset regions found: "
-        f"{transition_count}"
-    )
-
-    similarities = np.array(
-        [
-            item["similarity"]
-            for item in matches
-            if item["similarity"]
-            is not None
-        ],
-        dtype=float,
-    )
-
-    print("")
-    print(
-        "Aligned structural similarity:"
-    )
-
-    print(
-        f"  Mean: "
-        f"{np.mean(similarities):.4f}"
-    )
-
-    print(
-        f"  Median: "
-        f"{np.median(similarities):.4f}"
-    )
-
-    print(
-        f"  10th percentile: "
-        f"{np.percentile(similarities, 10):.4f}"
-    )
-
-    print(
-        f"  25th percentile: "
-        f"{np.percentile(similarities, 25):.4f}"
-    )
-
-    print(
-        f"  Minimum: "
-        f"{np.min(similarities):.4f}"
-    )
-
-    return matches
-
-
-def print_lowest_aligned_pairs(
-    matches,
-):
-    """
-    Print lowest-similarity pairs AFTER page alignment.
-    """
-    sorted_matches = sorted(
-        matches,
-        key=lambda item:
-        item["similarity"],
-    )
-
-    print("")
-    print(
-        "Lowest aligned structural matches:"
-    )
-
-    for item in sorted_matches[
-        :30
-    ]:
-        offset = (
-            item["new_page"]
-            - item["old_page"]
-        )
-
-        print(
-            f'  Old {item["old_page"]} '
-            f'-> New {item["new_page"]} '
-            f'| offset {offset:+d} '
-            f'| similarity '
-            f'{item["similarity"]:.4f}'
-        )
-
-    return sorted_matches
-
-
-def add_label(
-    image,
-    text,
-):
-    """
-    Add a title header above one diagnostic panel.
-    """
-    if len(image.shape) == 2:
-        display = cv2.cvtColor(
-            image,
-            cv2.COLOR_GRAY2BGR,
-        )
-    else:
-        display = image.copy()
-
-    header_height = 40
-
-    canvas = np.full(
-        (
-            display.shape[0]
-            + header_height,
-            display.shape[1],
-            3,
-        ),
-        255,
-        dtype=np.uint8,
-    )
-
-    canvas[
-        header_height:,
-        :,
-    ] = display
-
-    cv2.putText(
-        canvas,
-        text,
-        (
-            8,
-            26,
-        ),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.55,
-        (
-            0,
-            0,
-            0,
-        ),
-        1,
-        cv2.LINE_AA,
-    )
-
-    return canvas
-
-
-def save_alignment_diagnostic(
-    match,
-    older_pages,
-    newer_pages,
-):
-    """
-    Save four-panel diagnostic for one aligned pair.
-
-    OLD PAGE | NEW PAGE | OLD EDGES | NEW EDGES
-    """
-    old_page_number = (
-        match["old_page"]
-    )
-
-    new_page_number = (
-        match["new_page"]
-    )
-
-    older = older_pages[
-        old_page_number - 1
-    ]
-
-    newer = newer_pages[
-        new_page_number - 1
-    ]
-
-    older_page_panel = add_label(
-        older["image"],
-        f"OLD PAGE {old_page_number}",
-    )
-
-    newer_page_panel = add_label(
-        newer["image"],
-        f"NEW PAGE {new_page_number}",
-    )
-
-    older_edge_panel = add_label(
-        older["edges"],
-        "OLD EDGES",
-    )
-
-    newer_edge_panel = add_label(
-        newer["edges"],
-        "NEW EDGES",
-    )
-
-    combined = cv2.hconcat(
-        [
-            older_page_panel,
-            newer_page_panel,
-            older_edge_panel,
-            newer_edge_panel,
+    older_document = (
+        pair[
+            "older_document"
         ]
     )
 
-    footer_height = 48
-
-    final_image = np.full(
-        (
-            combined.shape[0]
-            + footer_height,
-            combined.shape[1],
-            3,
-        ),
-        255,
-        dtype=np.uint8,
+    newer_document = (
+        pair[
+            "newer_document"
+        ]
     )
 
-    final_image[
-        :combined.shape[0],
-        :,
-    ] = combined
-
-    offset = (
-        new_page_number
-        - old_page_number
-    )
-
-    footer_text = (
-        f"42129 aligned comparison | "
-        f"old {old_page_number} -> "
-        f"new {new_page_number} | "
-        f"offset {offset:+d} | "
-        f"similarity "
-        f'{match["similarity"]:.4f}'
-    )
-
-    cv2.putText(
-        final_image,
-        footer_text,
-        (
-            12,
-            combined.shape[0] + 30,
-        ),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.53,
-        (
-            0,
-            0,
-            0,
-        ),
-        1,
-        cv2.LINE_AA,
-    )
-
-    filename = (
-        f"42129_aligned_"
-        f"old_{old_page_number:04d}_"
-        f"new_{new_page_number:04d}.png"
-    )
-
-    output_path = (
-        OUTPUT_DIR
-        / filename
-    )
-
-    cv2.imwrite(
-        str(output_path),
-        final_image,
-    )
-
-    print(
-        f"    Saved: "
-        f"{output_path}"
-    )
-
-
-def main():
-    print("")
-    print(
-        "BrickTrip LEGO PDF Sequence Alignment"
-    )
-
-    print(
-        "====================================="
-    )
-
-    print(
-        f"Controlled positive test: "
-        f"{TEST_SET_NUM}"
-    )
-
-    print(
-        "READ ONLY — database writes: NONE"
-    )
-
-    OUTPUT_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    older_document = get_document(
-        OLDER_DOCUMENT
-    )
-
-    newer_document = get_document(
-        NEWER_DOCUMENT
-    )
-
-    print("")
-    print(
-        "Older description: "
-        + str(
-            older_document.get(
-                "description"
-            )
+    older_number = str(
+        older_document.get(
+            "document_number"
         )
     )
 
-    print(
-        "Newer description: "
-        + str(
-            newer_document.get(
-                "description"
-            )
+    newer_number = str(
+        newer_document.get(
+            "document_number"
         )
     )
 
     older_bytes = download_pdf(
-        older_document
+        older_document,
+        pdf_cache,
     )
 
     newer_bytes = download_pdf(
-        newer_document
+        newer_document,
+        pdf_cache,
     )
 
     older_pdf = open_pdf(
@@ -1385,34 +1493,21 @@ def main():
     )
 
     try:
-        print("")
-        print(
-            f"Older PDF pages: "
-            f"{len(older_pdf)}"
+
+        older_page_count = len(
+            older_pdf
         )
 
-        print(
-            f"Newer PDF pages: "
-            f"{len(newer_pdf)}"
+        newer_page_count = len(
+            newer_pdf
         )
 
-        print(
-            f"Raw page-count difference: "
-            f"{len(newer_pdf) - len(older_pdf):+d}"
+        older_pages = prepare_pdf(
+            older_pdf
         )
 
-        older_pages = (
-            prepare_pdf_pages(
-                older_pdf,
-                "older",
-            )
-        )
-
-        newer_pages = (
-            prepare_pdf_pages(
-                newer_pdf,
-                "newer",
-            )
+        newer_pages = prepare_pdf(
+            newer_pdf
         )
 
         similarity_cache = (
@@ -1422,77 +1517,692 @@ def main():
             )
         )
 
-        alignment = (
-            align_page_sequences(
-                older_pages,
-                newer_pages,
-                similarity_cache,
+        alignment = align_pages(
+            older_pages,
+            newer_pages,
+            similarity_cache,
+        )
+
+        matches = [
+            item
+            for item
+            in alignment
+            if item["operation"]
+            == "match"
+        ]
+
+        insertions = [
+            item
+            for item
+            in alignment
+            if item["operation"]
+            == "insert"
+        ]
+
+        deletions = [
+            item
+            for item
+            in alignment
+            if item["operation"]
+            == "delete"
+        ]
+
+        similarities = np.array(
+            [
+                item[
+                    "similarity"
+                ]
+                for item
+                in matches
+            ],
+            dtype=float,
+        )
+
+        if len(
+            similarities
+        ) == 0:
+
+            raise RuntimeError(
+                "No aligned page matches "
+                "were produced."
+            )
+
+        median = float(
+            np.median(
+                similarities
             )
         )
 
-        matches = summarize_alignment(
-            alignment
-        )
-
-        sorted_matches = (
-            print_lowest_aligned_pairs(
-                matches
+        p10 = float(
+            np.percentile(
+                similarities,
+                10,
             )
         )
 
-        print("")
-        print(
-            f"Saving diagnostics for "
-            f"lowest "
-            f"{LOWEST_PAIRS_TO_SAVE} "
-            f"aligned pairs..."
-        )
-
-        for match in sorted_matches[
-            :LOWEST_PAIRS_TO_SAVE
-        ]:
-            save_alignment_diagnostic(
-                match,
-                older_pages,
-                newer_pages,
+        minimum = float(
+            np.min(
+                similarities
             )
-
-        print("")
-        print("=" * 72)
-
-        print(
-            "SEQUENCE ALIGNMENT TEST COMPLETE"
         )
 
-        print(
-            f"Total alignment operations: "
-            f"{len(alignment)}"
+        mean = float(
+            np.mean(
+                similarities
+            )
         )
 
-        print(
-            f"Matched pairs: "
-            f"{sum(1 for item in alignment if item['operation'] == 'match')}"
+        low_count = int(
+            np.count_nonzero(
+                similarities
+                < REVISION_LOW
+            )
         )
 
-        print(
-            f"New-page insertions: "
-            f"{sum(1 for item in alignment if item['operation'] == 'insert')}"
+        very_low_count = int(
+            np.count_nonzero(
+                similarities
+                < REVISION_VERY_LOW
+            )
         )
 
-        print(
-            f"Old-page deletions: "
-            f"{sum(1 for item in alignment if item['operation'] == 'delete')}"
+        low_fraction = (
+            low_count
+            / len(
+                similarities
+            )
         )
 
-        print(
-            "Database writes: 0"
-        )
-
-        print("=" * 72)
+        return {
+            "older_document":
+                older_number,
+            "newer_document":
+                newer_number,
+            "older_pages":
+                older_page_count,
+            "newer_pages":
+                newer_page_count,
+            "page_difference":
+                newer_page_count
+                - older_page_count,
+            "matched_pages":
+                len(
+                    matches
+                ),
+            "insertions":
+                len(
+                    insertions
+                ),
+            "deletions":
+                len(
+                    deletions
+                ),
+            "mean":
+                mean,
+            "median":
+                median,
+            "p10":
+                p10,
+            "minimum":
+                minimum,
+            "low_count":
+                low_count,
+            "very_low_count":
+                very_low_count,
+            "low_fraction":
+                low_fraction,
+        }
 
     finally:
+
         older_pdf.close()
         newer_pdf.close()
+
+
+def classify_pair(
+    result,
+):
+    """
+    Provisional old/new PDF-pair classification.
+    """
+    gaps = (
+        result[
+            "insertions"
+        ]
+        + result[
+            "deletions"
+        ]
+    )
+
+    median = result[
+        "median"
+    ]
+
+    p10 = result[
+        "p10"
+    ]
+
+    minimum = result[
+        "minimum"
+    ]
+
+    low_fraction = result[
+        "low_fraction"
+    ]
+
+    very_low_count = result[
+        "very_low_count"
+    ]
+
+    # --------------------------------------------------------
+    # Strong localized revision pattern.
+    #
+    # Example:
+    # 42129
+    #
+    # Most pages nearly identical, with a localized region of
+    # very poor matches and page sequence changes.
+    # --------------------------------------------------------
+
+    if (
+        median >= 0.85
+        and (
+            very_low_count >= 1
+            or gaps >= 2
+            or low_fraction >= 0.08
+        )
+    ):
+        return (
+            "revision_candidate"
+        )
+
+    # --------------------------------------------------------
+    # Broad substantial difference.
+    # --------------------------------------------------------
+
+    if (
+        low_fraction >= 0.20
+        or p10 < 0.45
+    ):
+        return (
+            "revision_candidate"
+        )
+
+    # --------------------------------------------------------
+    # Same-build / reprint pattern.
+    #
+    # Example:
+    # 10214 visual refresh.
+    # --------------------------------------------------------
+
+    if (
+        median
+        >= REPRINT_MEDIAN_MIN
+        and p10
+        >= REPRINT_P10_MIN
+        and minimum
+        >= REPRINT_MINIMUM_MIN
+        and gaps <= 1
+    ):
+        return (
+            "same_build_reprint"
+        )
+
+    return (
+        "needs_deeper_review"
+    )
+
+
+def classify_set(
+    pair_results,
+):
+    """
+    Roll all comparable booklet results into one set-level result.
+    """
+    if not pair_results:
+        return (
+            "no_comparable_generation"
+        )
+
+    classifications = [
+        item[
+            "classification"
+        ]
+        for item
+        in pair_results
+    ]
+
+    if (
+        "revision_candidate"
+        in classifications
+    ):
+        return (
+            "revision_candidate"
+        )
+
+    if all(
+        classification
+        == "same_build_reprint"
+        for classification
+        in classifications
+    ):
+        return (
+            "same_build_reprint"
+        )
+
+    return (
+        "needs_deeper_review"
+    )
+
+
+def research_set(
+    set_num,
+    pdf_cache,
+):
+    """
+    Run integrated read-only research for one benchmark set.
+    """
+    log("")
+    log(
+        "=" * 72
+    )
+
+    log(
+        f"SET {set_num}"
+    )
+
+    log(
+        "=" * 72
+    )
+
+    documents = (
+        get_instruction_documents(
+            set_num
+        )
+    )
+
+    primary_documents = [
+        document
+        for document
+        in documents
+        if is_main_instruction(
+            document
+        )
+    ]
+
+    log(
+        f"Instruction records: "
+        f"{len(documents)}"
+    )
+
+    log(
+        f"Primary instruction PDFs: "
+        f"{len(primary_documents)}"
+    )
+
+    pairs = (
+        build_metadata_pairs(
+            documents
+        )
+    )
+
+    log(
+        f"Comparable metadata pairs: "
+        f"{len(pairs)}"
+    )
+
+    if not pairs:
+
+        log(
+            "SET RESULT: "
+            "no_comparable_generation"
+        )
+
+        return {
+            "set_num":
+                set_num,
+            "classification":
+                "no_comparable_generation",
+            "pairs":
+                [],
+        }
+
+    pair_results = []
+
+    for pair_index, pair in enumerate(
+        pairs,
+        start=1,
+    ):
+
+        older_document = (
+            pair[
+                "older_document"
+            ]
+        )
+
+        newer_document = (
+            pair[
+                "newer_document"
+            ]
+        )
+
+        older_number = str(
+            older_document.get(
+                "document_number"
+            )
+        )
+
+        newer_number = str(
+            newer_document.get(
+                "document_number"
+            )
+        )
+
+        log("")
+        log(
+            f"  Pair "
+            f"{pair_index}/"
+            f"{len(pairs)}"
+        )
+
+        log(
+            f"  Identity: "
+            f'{pair["identity"]}'
+        )
+
+        log(
+            f"  "
+            f"{older_number} "
+            f"-> "
+            f"{newer_number}"
+        )
+
+        log(
+            f"  "
+            f'{pair["older_generation"]["date"]}'
+            f" -> "
+            f'{pair["newer_generation"]["date"]}'
+        )
+
+        try:
+
+            result = (
+                analyze_pdf_pair(
+                    pair,
+                    pdf_cache,
+                )
+            )
+
+            classification = (
+                classify_pair(
+                    result
+                )
+            )
+
+            result[
+                "identity"
+            ] = pair[
+                "identity"
+            ]
+
+            result[
+                "classification"
+            ] = (
+                classification
+            )
+
+            pair_results.append(
+                result
+            )
+
+            log(
+                f"    Old pages: "
+                f'{result["older_pages"]}'
+            )
+
+            log(
+                f"    New pages: "
+                f'{result["newer_pages"]}'
+            )
+
+            log(
+                f"    Page count delta: "
+                f'{result["page_difference"]:+d}'
+            )
+
+            log(
+                f"    Alignment gaps: "
+                f'{result["insertions"]} '
+                f"new-only / "
+                f'{result["deletions"]} '
+                f"old-only"
+            )
+
+            log(
+                f"    Mean similarity: "
+                f'{result["mean"]:.4f}'
+            )
+
+            log(
+                f"    Median similarity: "
+                f'{result["median"]:.4f}'
+            )
+
+            log(
+                f"    10th percentile: "
+                f'{result["p10"]:.4f}'
+            )
+
+            log(
+                f"    Minimum: "
+                f'{result["minimum"]:.4f}'
+            )
+
+            log(
+                f"    Pages below "
+                f"{REVISION_LOW:.2f}: "
+                f'{result["low_count"]}'
+            )
+
+            log(
+                f"    Pages below "
+                f"{REVISION_VERY_LOW:.2f}: "
+                f'{result["very_low_count"]}'
+            )
+
+            log(
+                f"    PAIR RESULT: "
+                f"{classification}"
+            )
+
+        except Exception as error:
+
+            log(
+                f"    ERROR: "
+                f"{error}"
+            )
+
+            pair_results.append({
+                "identity":
+                    pair[
+                        "identity"
+                    ],
+                "classification":
+                    "needs_deeper_review",
+                "error":
+                    str(
+                        error
+                    ),
+            })
+
+    set_classification = (
+        classify_set(
+            pair_results
+        )
+    )
+
+    log("")
+    log(
+        f"SET RESULT: "
+        f"{set_classification}"
+    )
+
+    return {
+        "set_num":
+            set_num,
+        "classification":
+            set_classification,
+        "pairs":
+            pair_results,
+    }
+
+
+def main():
+    OUTPUT_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    SUMMARY_FILE.write_text(
+        "",
+        encoding="utf-8",
+    )
+
+    log("")
+    log(
+        "BrickTrip Integrated Revision Diagnostic"
+    )
+
+    log(
+        "========================================"
+    )
+
+    log(
+        "READ ONLY — database writes: NONE"
+    )
+
+    log("")
+    log(
+        f"Benchmark sets: "
+        f"{len(TEST_SET_NUMBERS)}"
+    )
+
+    pdf_cache = {}
+
+    results = []
+
+    succeeded = 0
+    failed = 0
+
+    for set_num in (
+        TEST_SET_NUMBERS
+    ):
+
+        try:
+
+            result = research_set(
+                set_num,
+                pdf_cache,
+            )
+
+            results.append(
+                result
+            )
+
+            succeeded += 1
+
+        except Exception as error:
+
+            failed += 1
+
+            log("")
+            log(
+                f"FATAL ERROR for "
+                f"{set_num}: "
+                f"{error}"
+            )
+
+            results.append({
+                "set_num":
+                    set_num,
+                "classification":
+                    "needs_deeper_review",
+                "error":
+                    str(
+                        error
+                    ),
+            })
+
+    log("")
+    log(
+        "=" * 72
+    )
+
+    log(
+        "BENCHMARK SUMMARY"
+    )
+
+    log(
+        "=" * 72
+    )
+
+    for result in results:
+
+        log(
+            f'{result["set_num"]}: '
+            f'{result["classification"]}'
+        )
+
+    counts = (
+        defaultdict(
+            int
+        )
+    )
+
+    for result in results:
+
+        counts[
+            result[
+                "classification"
+            ]
+        ] += 1
+
+    log("")
+    log(
+        "Classification totals:"
+    )
+
+    for classification in [
+        "revision_candidate",
+        "same_build_reprint",
+        "no_comparable_generation",
+        "needs_deeper_review",
+    ]:
+
+        log(
+            f"  "
+            f"{classification}: "
+            f"{counts[classification]}"
+        )
+
+    log("")
+    log(
+        f"Sets completed: "
+        f"{succeeded}"
+    )
+
+    log(
+        f"Sets failed: "
+        f"{failed}"
+    )
+
+    log(
+        "Database writes: 0"
+    )
+
+    log(
+        "=" * 72
+    )
 
 
 if __name__ == "__main__":
