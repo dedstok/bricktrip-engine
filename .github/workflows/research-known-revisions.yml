@@ -24,3 +24,11 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
         run: python pipeline/research_known_revisions.py
+
+      - name: Upload comparison images
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bricktrip-pdf-comparisons
+          path: artifacts/bricktrip_pdf_comparisons/
+          if-no-files-found: warn
