@@ -1,8 +1,9 @@
-import hashlib
 import os
+from io import BytesIO
 
-import fitz
+import pymupdf
 import requests
+from PIL import Image, ImageChops
 from supabase import create_client
 
 
@@ -16,25 +17,23 @@ supabase = create_client(
 
 
 # ------------------------------------------------------------
-# CONTROLLED READ-ONLY VISUAL PDF TEST
+# CONTROLLED READ-ONLY NORMALIZED VISUAL TEST
 # ------------------------------------------------------------
 #
 # LEGO set 10214-1 only.
 #
 # This test:
-# - downloads official LEGO PDFs
-# - renders pages visually
-# - compares rendered page images
-# - distinguishes tiny cosmetic changes from substantial ones
+# - downloads official LEGO instruction PDFs
+# - renders each page as an image
+# - crops empty margins
+# - normalizes scale and canvas size
+# - visually compares old/new instruction pages
 #
-# It DOES NOT:
-# - insert evidence
-# - update revision_candidates
-# - create revisions
-# - modify Supabase in any way
+# NOTHING is written to Supabase.
 # ------------------------------------------------------------
 
 TEST_SET_NUM = "10214-1"
+
 
 TEST_PAIRS = [
     {
@@ -66,30 +65,41 @@ TEST_PAIRS = [
 
 
 # ------------------------------------------------------------
-# VISUAL COMPARISON SETTINGS
+# IMAGE SETTINGS
 # ------------------------------------------------------------
 
-# First pass uses a small grayscale rendering.
-# This makes comparing hundreds of pages fast.
-THUMBNAIL_SCALE = 0.30
+# Render quality.
+RENDER_SCALE = 1.0
 
-# If the thumbnail says a page changed, we render that page again
-# at normal PDF resolution for a more accurate measurement.
-DETAIL_SCALE = 1.0
+# All cropped pages are fitted inside this square canvas.
+NORMALIZED_SIZE = 512
 
-# Pixel difference of 20/255 or greater counts as visibly changed.
+# Pixels lighter than this are treated as effectively white
+# when finding the visible printed area.
+WHITE_THRESHOLD = 245
+
+# A small amount of space retained around detected page content.
+CROP_PADDING = 8
+
+# Difference of at least this many grayscale levels counts
+# as a visibly changed pixel.
 PIXEL_CHANGE_THRESHOLD = 20
 
-# Classification thresholds.
-#
-# These are intentionally conservative for this diagnostic test.
+
+# ------------------------------------------------------------
+# CLASSIFICATION THRESHOLDS
+# ------------------------------------------------------------
+
+# Mean grayscale difference divided by 255.
+
 NEAR_IDENTICAL_SCORE = 0.002
-SMALL_CHANGE_SCORE = 0.020
+SMALL_CHANGE_SCORE = 0.015
+MODERATE_CHANGE_SCORE = 0.050
 
 
 def get_instruction_documents():
     """
-    Fetch metadata for every document required by this test.
+    Fetch metadata only for the documents needed by this test.
     """
     required_numbers = set()
 
@@ -97,6 +107,7 @@ def get_instruction_documents():
         required_numbers.add(
             pair["older_document"]
         )
+
         required_numbers.add(
             pair["newer_document"]
         )
@@ -111,7 +122,10 @@ def get_instruction_documents():
             "source_date_added,"
             "source_date_modified"
         )
-        .eq("set_num", TEST_SET_NUM)
+        .eq(
+            "set_num",
+            TEST_SET_NUM,
+        )
         .in_(
             "document_number",
             sorted(required_numbers),
@@ -123,7 +137,9 @@ def get_instruction_documents():
 
     for document in response.data or []:
         number = str(
-            document.get("document_number")
+            document.get(
+                "document_number"
+            )
         )
 
         documents[number] = document
@@ -133,10 +149,12 @@ def get_instruction_documents():
 
 def download_pdf(document):
     """
-    Download one official LEGO PDF.
+    Download one official LEGO instruction PDF.
     """
     document_number = str(
-        document.get("document_number")
+        document.get(
+            "document_number"
+        )
     )
 
     source_url = document.get(
@@ -162,7 +180,9 @@ def download_pdf(document):
 
     pdf_bytes = response.content
 
-    if not pdf_bytes.startswith(b"%PDF"):
+    if not pdf_bytes.startswith(
+        b"%PDF"
+    ):
         raise RuntimeError(
             f"Document {document_number} "
             f"did not download as a PDF."
@@ -176,126 +196,244 @@ def download_pdf(document):
     return pdf_bytes
 
 
-def file_hash(pdf_bytes):
-    """
-    Whole-file SHA256 hash.
-    """
-    return hashlib.sha256(
-        pdf_bytes
-    ).hexdigest()
-
-
 def open_pdf(pdf_bytes):
     """
     Open PDF bytes with PyMuPDF.
     """
-    return fitz.open(
+    return pymupdf.open(
         stream=pdf_bytes,
         filetype="pdf",
     )
 
 
-def render_page(page, scale):
+def render_page(page):
     """
-    Render one PDF page into a grayscale image.
-
-    Returns:
-        width
-        height
-        raw grayscale pixel bytes
+    Render one PDF page as a grayscale Pillow image.
     """
-    matrix = fitz.Matrix(
-        scale,
-        scale,
+    matrix = pymupdf.Matrix(
+        RENDER_SCALE,
+        RENDER_SCALE,
     )
 
     pixmap = page.get_pixmap(
         matrix=matrix,
-        colorspace=fitz.csGRAY,
+        colorspace=pymupdf.csGRAY,
         alpha=False,
     )
 
-    return {
-        "width": pixmap.width,
-        "height": pixmap.height,
-        "samples": pixmap.samples,
-    }
+    image = Image.frombytes(
+        "L",
+        (
+            pixmap.width,
+            pixmap.height,
+        ),
+        pixmap.samples,
+    )
+
+    return image
 
 
-def compare_rendered_images(
+def find_content_bbox(image):
+    """
+    Find the visible printed region of a grayscale page.
+
+    White page margins are ignored.
+    """
+    threshold_image = image.point(
+        lambda value:
+        0
+        if value >= WHITE_THRESHOLD
+        else 255
+    )
+
+    bbox = threshold_image.getbbox()
+
+    if bbox is None:
+        return (
+            0,
+            0,
+            image.width,
+            image.height,
+        )
+
+    left, top, right, bottom = bbox
+
+    left = max(
+        0,
+        left - CROP_PADDING,
+    )
+
+    top = max(
+        0,
+        top - CROP_PADDING,
+    )
+
+    right = min(
+        image.width,
+        right + CROP_PADDING,
+    )
+
+    bottom = min(
+        image.height,
+        bottom + CROP_PADDING,
+    )
+
+    return (
+        left,
+        top,
+        right,
+        bottom,
+    )
+
+
+def crop_content(image):
+    """
+    Remove excess white margin around page content.
+    """
+    bbox = find_content_bbox(
+        image
+    )
+
+    return image.crop(
+        bbox
+    )
+
+
+def normalize_page(image):
+    """
+    Normalize a rendered LEGO instruction page.
+
+    Process:
+    1. crop mostly-empty margins
+    2. preserve aspect ratio
+    3. resize printed content
+    4. center it on a fixed white canvas
+
+    This reduces false positives caused by different PDF page
+    dimensions, margins, and export scaling.
+    """
+    cropped = crop_content(
+        image
+    )
+
+    if (
+        cropped.width <= 0
+        or cropped.height <= 0
+    ):
+        return Image.new(
+            "L",
+            (
+                NORMALIZED_SIZE,
+                NORMALIZED_SIZE,
+            ),
+            255,
+        )
+
+    maximum_content_size = (
+        NORMALIZED_SIZE - 20
+    )
+
+    scale = min(
+        maximum_content_size
+        / cropped.width,
+        maximum_content_size
+        / cropped.height,
+    )
+
+    new_width = max(
+        1,
+        round(
+            cropped.width * scale
+        ),
+    )
+
+    new_height = max(
+        1,
+        round(
+            cropped.height * scale
+        ),
+    )
+
+    resized = cropped.resize(
+        (
+            new_width,
+            new_height,
+        ),
+        Image.Resampling.LANCZOS,
+    )
+
+    canvas = Image.new(
+        "L",
+        (
+            NORMALIZED_SIZE,
+            NORMALIZED_SIZE,
+        ),
+        255,
+    )
+
+    x = (
+        NORMALIZED_SIZE
+        - new_width
+    ) // 2
+
+    y = (
+        NORMALIZED_SIZE
+        - new_height
+    ) // 2
+
+    canvas.paste(
+        resized,
+        (
+            x,
+            y,
+        ),
+    )
+
+    return canvas
+
+
+def compare_images(
     older_image,
     newer_image,
 ):
     """
-    Compare two grayscale rendered page images.
+    Compare two normalized grayscale images using histogram math.
 
-    Returns:
-    - mean absolute pixel difference
-    - normalized difference score
-    - percentage of pixels exceeding our visible-change threshold
+    This avoids slowly looping through every pixel in Python.
     """
-    if (
-        older_image["width"]
-        != newer_image["width"]
-        or older_image["height"]
-        != newer_image["height"]
-    ):
-        return {
-            "same_dimensions": False,
-            "difference_score": 1.0,
-            "changed_pixel_percent": 100.0,
-        }
+    difference_image = (
+        ImageChops.difference(
+            older_image,
+            newer_image,
+        )
+    )
 
-    older_pixels = older_image[
-        "samples"
-    ]
+    histogram = (
+        difference_image.histogram()
+    )
 
-    newer_pixels = newer_image[
-        "samples"
-    ]
-
-    if older_pixels == newer_pixels:
-        return {
-            "same_dimensions": True,
-            "difference_score": 0.0,
-            "changed_pixel_percent": 0.0,
-        }
-
-    total_pixels = len(
-        older_pixels
+    total_pixels = sum(
+        histogram
     )
 
     if total_pixels == 0:
         return {
-            "same_dimensions": True,
             "difference_score": 0.0,
             "changed_pixel_percent": 0.0,
+            "maximum_difference": 0,
         }
 
-    absolute_difference_sum = 0
-    visibly_changed_pixels = 0
+    weighted_difference = 0
 
-    for older_value, newer_value in zip(
-        older_pixels,
-        newer_pixels,
+    for pixel_value, count in enumerate(
+        histogram
     ):
-        difference = abs(
-            older_value
-            - newer_value
+        weighted_difference += (
+            pixel_value * count
         )
-
-        absolute_difference_sum += (
-            difference
-        )
-
-        if (
-            difference
-            >= PIXEL_CHANGE_THRESHOLD
-        ):
-            visibly_changed_pixels += 1
 
     mean_difference = (
-        absolute_difference_sum
+        weighted_difference
         / total_pixels
     )
 
@@ -304,31 +442,46 @@ def compare_rendered_images(
         / 255.0
     )
 
+    visibly_changed_pixels = sum(
+        histogram[
+            PIXEL_CHANGE_THRESHOLD:
+        ]
+    )
+
     changed_pixel_percent = (
         visibly_changed_pixels
         / total_pixels
         * 100.0
     )
 
+    maximum_difference = 0
+
+    for pixel_value in range(
+        255,
+        -1,
+        -1,
+    ):
+        if histogram[pixel_value]:
+            maximum_difference = (
+                pixel_value
+            )
+            break
+
     return {
-        "same_dimensions": True,
         "difference_score":
             difference_score,
         "changed_pixel_percent":
             changed_pixel_percent,
+        "maximum_difference":
+            maximum_difference,
     }
 
 
-def classify_page(comparison):
+def classify_page(result):
     """
-    Convert the numerical visual score into a human-readable label.
+    Convert a normalized visual difference score into a label.
     """
-    if not comparison[
-        "same_dimensions"
-    ]:
-        return "SUBSTANTIAL"
-
-    score = comparison[
+    score = result[
         "difference_score"
     ]
 
@@ -341,6 +494,9 @@ def classify_page(comparison):
     if score < SMALL_CHANGE_SCORE:
         return "SMALL CHANGE"
 
+    if score < MODERATE_CHANGE_SCORE:
+        return "MODERATE CHANGE"
+
     return "SUBSTANTIAL"
 
 
@@ -349,93 +505,44 @@ def compare_page(
     newer_page,
 ):
     """
-    Efficient two-stage visual comparison.
-
-    Stage 1:
-        low-resolution thumbnail
-
-    Stage 2:
-        full-resolution rendering only when needed
+    Render, normalize, and compare one page pair.
     """
-    older_thumbnail = render_page(
-        older_page,
-        THUMBNAIL_SCALE,
+    older_render = render_page(
+        older_page
     )
 
-    newer_thumbnail = render_page(
-        newer_page,
-        THUMBNAIL_SCALE,
+    newer_render = render_page(
+        newer_page
     )
 
-    thumbnail_comparison = (
-        compare_rendered_images(
-            older_thumbnail,
-            newer_thumbnail,
-        )
+    older_normalized = normalize_page(
+        older_render
     )
 
-    thumbnail_classification = (
-        classify_page(
-            thumbnail_comparison
-        )
+    newer_normalized = normalize_page(
+        newer_render
     )
 
-    if (
-        thumbnail_classification
-        == "IDENTICAL"
-    ):
-        return {
-            "classification":
-                "IDENTICAL",
-            "difference_score":
-                0.0,
-            "changed_pixel_percent":
-                0.0,
-        }
-
-    older_detail = render_page(
-        older_page,
-        DETAIL_SCALE,
+    result = compare_images(
+        older_normalized,
+        newer_normalized,
     )
 
-    newer_detail = render_page(
-        newer_page,
-        DETAIL_SCALE,
+    result[
+        "classification"
+    ] = classify_page(
+        result
     )
 
-    detail_comparison = (
-        compare_rendered_images(
-            older_detail,
-            newer_detail,
-        )
-    )
-
-    classification = (
-        classify_page(
-            detail_comparison
-        )
-    )
-
-    return {
-        "classification":
-            classification,
-        "difference_score":
-            detail_comparison[
-                "difference_score"
-            ],
-        "changed_pixel_percent":
-            detail_comparison[
-                "changed_pixel_percent"
-            ],
-    }
+    return result
 
 
-def summarize_page_numbers(
+def summarize_pages(
     pages,
     maximum_display=40,
 ):
     """
-    Keep GitHub logs readable.
+    Keep GitHub logs manageable.
     """
     if not pages:
         return "none"
@@ -450,7 +557,7 @@ def summarize_page_numbers(
         :maximum_display
     ]
 
-    text = ", ".join(
+    visible_text = ", ".join(
         str(page)
         for page in visible
     )
@@ -461,7 +568,7 @@ def summarize_page_numbers(
     )
 
     return (
-        f"{text}, "
+        f"{visible_text}, "
         f"... +{remaining} more"
     )
 
@@ -469,10 +576,10 @@ def summarize_page_numbers(
 def compare_pair(
     pair,
     documents,
-    pdf_byte_cache,
+    pdf_cache,
 ):
     """
-    Compare one old/new LEGO instruction pair visually.
+    Compare one old/new instruction booklet pair.
     """
     older_number = pair[
         "older_document"
@@ -484,7 +591,9 @@ def compare_pair(
 
     print("")
     print("=" * 72)
-    print(pair["label"])
+    print(
+        pair["label"]
+    )
     print(
         f"{older_number} -> "
         f"{newer_number}"
@@ -529,43 +638,30 @@ def compare_pair(
         )
     )
 
-    if older_number not in pdf_byte_cache:
-        pdf_byte_cache[
+    if older_number not in pdf_cache:
+        pdf_cache[
             older_number
         ] = download_pdf(
             older_document
         )
 
-    if newer_number not in pdf_byte_cache:
-        pdf_byte_cache[
+    if newer_number not in pdf_cache:
+        pdf_cache[
             newer_number
         ] = download_pdf(
             newer_document
         )
 
-    older_bytes = pdf_byte_cache[
-        older_number
-    ]
-
-    newer_bytes = pdf_byte_cache[
-        newer_number
-    ]
-
-    same_file = (
-        file_hash(
-            older_bytes
-        )
-        == file_hash(
-            newer_bytes
-        )
-    )
-
     older_pdf = open_pdf(
-        older_bytes
+        pdf_cache[
+            older_number
+        ]
     )
 
     newer_pdf = open_pdf(
-        newer_bytes
+        pdf_cache[
+            newer_number
+        ]
     )
 
     try:
@@ -575,6 +671,11 @@ def compare_pair(
 
         newer_page_count = len(
             newer_pdf
+        )
+
+        shared_page_count = min(
+            older_page_count,
+            newer_page_count,
         )
 
         print("")
@@ -589,21 +690,22 @@ def compare_pair(
         )
 
         print(
-            f"Whole PDFs byte-identical: "
-            f"{same_file}"
-        )
-
-        shared_page_count = min(
-            older_page_count,
-            newer_page_count,
+            f"Shared pages: "
+            f"{shared_page_count}"
         )
 
         identical_pages = []
         near_identical_pages = []
         small_change_pages = []
+        moderate_change_pages = []
         substantial_pages = []
 
         page_results = {}
+
+        print("")
+        print(
+            "Rendering and normalizing pages..."
+        )
 
         for index in range(
             shared_page_count
@@ -640,6 +742,11 @@ def compare_pair(
                     page_number
                 )
 
+            elif classification == "MODERATE CHANGE":
+                moderate_change_pages.append(
+                    page_number
+                )
+
             else:
                 substantial_pages.append(
                     page_number
@@ -661,7 +768,14 @@ def compare_pair(
 
         print("")
         print(
-            f"Visually identical pages: "
+            "NORMALIZED VISUAL RESULTS"
+        )
+        print(
+            "-------------------------"
+        )
+
+        print(
+            f"Identical pages: "
             f"{len(identical_pages)}"
         )
 
@@ -676,42 +790,54 @@ def compare_pair(
         )
 
         print(
-            f"Substantially changed pages: "
+            f"Moderate-change pages: "
+            f"{len(moderate_change_pages)}"
+        )
+
+        print(
+            f"Substantial-change pages: "
             f"{len(substantial_pages)}"
         )
 
         print("")
         print(
-            "Near-identical page numbers: "
-            + summarize_page_numbers(
+            "Near-identical: "
+            + summarize_pages(
                 near_identical_pages
             )
         )
 
         print(
-            "Small-change page numbers: "
-            + summarize_page_numbers(
+            "Small changes: "
+            + summarize_pages(
                 small_change_pages
             )
         )
 
         print(
-            "Substantial-change page numbers: "
-            + summarize_page_numbers(
+            "Moderate changes: "
+            + summarize_pages(
+                moderate_change_pages
+            )
+        )
+
+        print(
+            "Substantial changes: "
+            + summarize_pages(
                 substantial_pages
             )
         )
 
         print(
-            "Pages only in older PDF: "
-            + summarize_page_numbers(
+            "Older-only pages: "
+            + summarize_pages(
                 older_only_pages
             )
         )
 
         print(
-            "Pages only in newer PDF: "
-            + summarize_page_numbers(
+            "Newer-only pages: "
+            + summarize_pages(
                 newer_only_pages
             )
         )
@@ -719,6 +845,7 @@ def compare_pair(
         changed_pages = (
             near_identical_pages
             + small_change_pages
+            + moderate_change_pages
             + substantial_pages
         )
 
@@ -736,20 +863,30 @@ def compare_pair(
                 ]
 
                 print(
-                    f"  Page {page_number}: "
+                    f"  Page "
+                    f"{page_number}: "
                     f'{result["classification"]} | '
                     f'difference score '
                     f'{result["difference_score"]:.6f} | '
                     f'changed pixels '
-                    f'{result["changed_pixel_percent"]:.3f}%'
+                    f'{result["changed_pixel_percent"]:.3f}% | '
+                    f'max pixel delta '
+                    f'{result["maximum_difference"]}'
                 )
 
+        meaningful_pages = (
+            moderate_change_pages
+            + substantial_pages
+        )
+
         print("")
-        print("PAIR ASSESSMENT:")
+        print(
+            "PAIR ASSESSMENT:"
+        )
 
         if (
             not small_change_pages
-            and not substantial_pages
+            and not meaningful_pages
             and not older_only_pages
             and not newer_only_pages
         ):
@@ -758,32 +895,49 @@ def compare_pair(
             )
 
             print(
-                "  Differences appear absent or "
-                "visually negligible."
+                "  Only visually negligible "
+                "differences remain after normalization."
             )
 
         elif (
-            not substantial_pages
+            not meaningful_pages
             and not older_only_pages
             and not newer_only_pages
         ):
             print(
-                "  POSSIBLE COSMETIC / PRINTING CHANGE"
+                "  LIKELY COSMETIC / PRINTING CHANGE"
             )
 
             print(
-                "  No page shows a substantial "
-                "visual difference."
+                "  Minor visual differences remain, "
+                "but no meaningful page-level change "
+                "was detected."
+            )
+
+        elif (
+            len(meaningful_pages) <= 2
+            and not older_only_pages
+            and not newer_only_pages
+        ):
+            print(
+                "  LOCALIZED VISUAL CHANGE"
+            )
+
+            print(
+                "  Only a small number of pages changed "
+                "meaningfully. These pages should be "
+                "inspected before calling this a build revision."
             )
 
         else:
             print(
-                "  MEANINGFUL VISUAL DIFFERENCE FOUND"
+                "  STRONG REVISION CANDIDATE"
             )
 
             print(
-                "  Candidate for deeper LEGO "
-                "step/inventory analysis."
+                "  Multiple instruction pages remain "
+                "meaningfully different even after "
+                "normalizing margins and scale."
             )
 
     finally:
@@ -794,15 +948,17 @@ def compare_pair(
 def main():
     print("")
     print(
-        "BrickTrip Visual LEGO PDF Comparison"
+        "BrickTrip Normalized LEGO PDF Comparison"
     )
     print(
-        "===================================="
+        "========================================"
     )
+
     print(
         f"Controlled test set: "
         f"{TEST_SET_NUM}"
     )
+
     print(
         "READ ONLY — database writes: NONE"
     )
@@ -817,7 +973,7 @@ def main():
         f"{len(documents)}"
     )
 
-    pdf_byte_cache = {}
+    pdf_cache = {}
 
     succeeded = 0
     failed = 0
@@ -827,7 +983,7 @@ def main():
             compare_pair(
                 pair,
                 documents,
-                pdf_byte_cache,
+                pdf_cache,
             )
 
             succeeded += 1
@@ -845,19 +1001,23 @@ def main():
     print("")
     print("=" * 72)
     print(
-        "VISUAL PDF TEST COMPLETE"
+        "NORMALIZED PDF TEST COMPLETE"
     )
+
     print(
         f"Comparisons succeeded: "
         f"{succeeded}"
     )
+
     print(
         f"Comparisons failed: "
         f"{failed}"
     )
+
     print(
         "Database writes: 0"
     )
+
     print("=" * 72)
 
 
