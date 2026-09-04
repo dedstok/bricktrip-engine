@@ -1,9 +1,8 @@
 import hashlib
-import io
 import os
 
+import fitz
 import requests
-from pypdf import PdfReader
 from supabase import create_client
 
 
@@ -17,15 +16,22 @@ supabase = create_client(
 
 
 # ------------------------------------------------------------
-# CONTROLLED READ-ONLY PDF TEST
+# CONTROLLED READ-ONLY VISUAL PDF TEST
 # ------------------------------------------------------------
 #
-# We are testing LEGO set 10214-1 only.
+# LEGO set 10214-1 only.
 #
-# These document pairs represent the SAME physical booklet slot
-# at different publication dates.
+# This test:
+# - downloads official LEGO PDFs
+# - renders pages visually
+# - compares rendered page images
+# - distinguishes tiny cosmetic changes from substantial ones
 #
-# Nothing is inserted, updated, or deleted in Supabase.
+# It DOES NOT:
+# - insert evidence
+# - update revision_candidates
+# - create revisions
+# - modify Supabase in any way
 # ------------------------------------------------------------
 
 TEST_SET_NUM = "10214-1"
@@ -59,23 +65,41 @@ TEST_PAIRS = [
 ]
 
 
+# ------------------------------------------------------------
+# VISUAL COMPARISON SETTINGS
+# ------------------------------------------------------------
+
+# First pass uses a small grayscale rendering.
+# This makes comparing hundreds of pages fast.
+THUMBNAIL_SCALE = 0.30
+
+# If the thumbnail says a page changed, we render that page again
+# at normal PDF resolution for a more accurate measurement.
+DETAIL_SCALE = 1.0
+
+# Pixel difference of 20/255 or greater counts as visibly changed.
+PIXEL_CHANGE_THRESHOLD = 20
+
+# Classification thresholds.
+#
+# These are intentionally conservative for this diagnostic test.
+NEAR_IDENTICAL_SCORE = 0.002
+SMALL_CHANGE_SCORE = 0.020
+
+
 def get_instruction_documents():
     """
-    Load only the instruction documents needed for this test.
+    Fetch metadata for every document required by this test.
     """
-    document_numbers = []
+    required_numbers = set()
 
     for pair in TEST_PAIRS:
-        document_numbers.append(
+        required_numbers.add(
             pair["older_document"]
         )
-        document_numbers.append(
+        required_numbers.add(
             pair["newer_document"]
         )
-
-    document_numbers = sorted(
-        set(document_numbers)
-    )
 
     response = (
         supabase
@@ -90,7 +114,7 @@ def get_instruction_documents():
         .eq("set_num", TEST_SET_NUM)
         .in_(
             "document_number",
-            document_numbers,
+            sorted(required_numbers),
         )
         .execute()
     )
@@ -109,7 +133,7 @@ def get_instruction_documents():
 
 def download_pdf(document):
     """
-    Download one official LEGO instruction PDF into memory.
+    Download one official LEGO PDF.
     """
     document_number = str(
         document.get("document_number")
@@ -131,7 +155,7 @@ def download_pdf(document):
 
     response = requests.get(
         source_url,
-        timeout=120,
+        timeout=180,
     )
 
     response.raise_for_status()
@@ -152,169 +176,266 @@ def download_pdf(document):
     return pdf_bytes
 
 
-def whole_file_hash(pdf_bytes):
+def file_hash(pdf_bytes):
     """
-    Hash the entire downloaded PDF file.
-
-    Different whole-file hashes prove the files are not
-    byte-for-byte identical, but that alone does NOT prove the
-    building instructions changed.
+    Whole-file SHA256 hash.
     """
     return hashlib.sha256(
         pdf_bytes
     ).hexdigest()
 
 
-def page_content_bytes(page):
+def open_pdf(pdf_bytes):
     """
-    Get the decoded PDF content-stream bytes for one page.
-
-    This focuses on the page's actual drawing/text instructions
-    rather than the PDF file's outer metadata.
+    Open PDF bytes with PyMuPDF.
     """
-    contents = page.get_contents()
-
-    if contents is None:
-        return b""
-
-    try:
-        return contents.get_data()
-
-    except AttributeError:
-        pass
-
-    try:
-        data_parts = []
-
-        for content in contents:
-            data_parts.append(
-                content.get_data()
-            )
-
-        return b"".join(
-            data_parts
-        )
-
-    except Exception:
-        return b""
-
-
-def page_content_hash(page):
-    """
-    Hash the decoded content stream for one PDF page.
-    """
-    content = page_content_bytes(
-        page
+    return fitz.open(
+        stream=pdf_bytes,
+        filetype="pdf",
     )
 
-    return hashlib.sha256(
-        content
-    ).hexdigest()
 
-
-def analyze_pdf(pdf_bytes):
+def render_page(page, scale):
     """
-    Read a PDF and calculate page-level content hashes.
-    """
-    reader = PdfReader(
-        io.BytesIO(pdf_bytes)
-    )
-
-    page_hashes = []
-
-    for page in reader.pages:
-        page_hashes.append(
-            page_content_hash(
-                page
-            )
-        )
-
-    return {
-        "page_count": len(reader.pages),
-        "page_hashes": page_hashes,
-        "file_hash": whole_file_hash(
-            pdf_bytes
-        ),
-    }
-
-
-def compare_page_hashes(
-    older_analysis,
-    newer_analysis,
-):
-    """
-    Compare same-numbered pages between two PDFs.
+    Render one PDF page into a grayscale image.
 
     Returns:
-    - matching pages
-    - changed pages
-    - pages that exist only in one PDF
+        width
+        height
+        raw grayscale pixel bytes
     """
-    older_hashes = (
-        older_analysis["page_hashes"]
+    matrix = fitz.Matrix(
+        scale,
+        scale,
     )
 
-    newer_hashes = (
-        newer_analysis["page_hashes"]
+    pixmap = page.get_pixmap(
+        matrix=matrix,
+        colorspace=fitz.csGRAY,
+        alpha=False,
     )
 
-    shared_page_count = min(
-        len(older_hashes),
-        len(newer_hashes),
-    )
+    return {
+        "width": pixmap.width,
+        "height": pixmap.height,
+        "samples": pixmap.samples,
+    }
 
-    matching_pages = []
-    changed_pages = []
 
-    for index in range(
-        shared_page_count
+def compare_rendered_images(
+    older_image,
+    newer_image,
+):
+    """
+    Compare two grayscale rendered page images.
+
+    Returns:
+    - mean absolute pixel difference
+    - normalized difference score
+    - percentage of pixels exceeding our visible-change threshold
+    """
+    if (
+        older_image["width"]
+        != newer_image["width"]
+        or older_image["height"]
+        != newer_image["height"]
     ):
-        page_number = index + 1
+        return {
+            "same_dimensions": False,
+            "difference_score": 1.0,
+            "changed_pixel_percent": 100.0,
+        }
+
+    older_pixels = older_image[
+        "samples"
+    ]
+
+    newer_pixels = newer_image[
+        "samples"
+    ]
+
+    if older_pixels == newer_pixels:
+        return {
+            "same_dimensions": True,
+            "difference_score": 0.0,
+            "changed_pixel_percent": 0.0,
+        }
+
+    total_pixels = len(
+        older_pixels
+    )
+
+    if total_pixels == 0:
+        return {
+            "same_dimensions": True,
+            "difference_score": 0.0,
+            "changed_pixel_percent": 0.0,
+        }
+
+    absolute_difference_sum = 0
+    visibly_changed_pixels = 0
+
+    for older_value, newer_value in zip(
+        older_pixels,
+        newer_pixels,
+    ):
+        difference = abs(
+            older_value
+            - newer_value
+        )
+
+        absolute_difference_sum += (
+            difference
+        )
 
         if (
-            older_hashes[index]
-            == newer_hashes[index]
+            difference
+            >= PIXEL_CHANGE_THRESHOLD
         ):
-            matching_pages.append(
-                page_number
-            )
-        else:
-            changed_pages.append(
-                page_number
-            )
+            visibly_changed_pixels += 1
 
-    older_only_pages = list(
-        range(
-            shared_page_count + 1,
-            len(older_hashes) + 1,
+    mean_difference = (
+        absolute_difference_sum
+        / total_pixels
+    )
+
+    difference_score = (
+        mean_difference
+        / 255.0
+    )
+
+    changed_pixel_percent = (
+        visibly_changed_pixels
+        / total_pixels
+        * 100.0
+    )
+
+    return {
+        "same_dimensions": True,
+        "difference_score":
+            difference_score,
+        "changed_pixel_percent":
+            changed_pixel_percent,
+    }
+
+
+def classify_page(comparison):
+    """
+    Convert the numerical visual score into a human-readable label.
+    """
+    if not comparison[
+        "same_dimensions"
+    ]:
+        return "SUBSTANTIAL"
+
+    score = comparison[
+        "difference_score"
+    ]
+
+    if score == 0:
+        return "IDENTICAL"
+
+    if score < NEAR_IDENTICAL_SCORE:
+        return "NEAR-IDENTICAL"
+
+    if score < SMALL_CHANGE_SCORE:
+        return "SMALL CHANGE"
+
+    return "SUBSTANTIAL"
+
+
+def compare_page(
+    older_page,
+    newer_page,
+):
+    """
+    Efficient two-stage visual comparison.
+
+    Stage 1:
+        low-resolution thumbnail
+
+    Stage 2:
+        full-resolution rendering only when needed
+    """
+    older_thumbnail = render_page(
+        older_page,
+        THUMBNAIL_SCALE,
+    )
+
+    newer_thumbnail = render_page(
+        newer_page,
+        THUMBNAIL_SCALE,
+    )
+
+    thumbnail_comparison = (
+        compare_rendered_images(
+            older_thumbnail,
+            newer_thumbnail,
         )
     )
 
-    newer_only_pages = list(
-        range(
-            shared_page_count + 1,
-            len(newer_hashes) + 1,
+    thumbnail_classification = (
+        classify_page(
+            thumbnail_comparison
+        )
+    )
+
+    if (
+        thumbnail_classification
+        == "IDENTICAL"
+    ):
+        return {
+            "classification":
+                "IDENTICAL",
+            "difference_score":
+                0.0,
+            "changed_pixel_percent":
+                0.0,
+        }
+
+    older_detail = render_page(
+        older_page,
+        DETAIL_SCALE,
+    )
+
+    newer_detail = render_page(
+        newer_page,
+        DETAIL_SCALE,
+    )
+
+    detail_comparison = (
+        compare_rendered_images(
+            older_detail,
+            newer_detail,
+        )
+    )
+
+    classification = (
+        classify_page(
+            detail_comparison
         )
     )
 
     return {
-        "matching_pages":
-            matching_pages,
-        "changed_pages":
-            changed_pages,
-        "older_only_pages":
-            older_only_pages,
-        "newer_only_pages":
-            newer_only_pages,
+        "classification":
+            classification,
+        "difference_score":
+            detail_comparison[
+                "difference_score"
+            ],
+        "changed_pixel_percent":
+            detail_comparison[
+                "changed_pixel_percent"
+            ],
     }
 
 
-def summarize_page_list(
+def summarize_page_numbers(
     pages,
     maximum_display=40,
 ):
     """
-    Keep GitHub logs readable if many pages differ.
+    Keep GitHub logs readable.
     """
     if not pages:
         return "none"
@@ -329,7 +450,7 @@ def summarize_page_list(
         :maximum_display
     ]
 
-    visible_text = ", ".join(
+    text = ", ".join(
         str(page)
         for page in visible
     )
@@ -340,7 +461,7 @@ def summarize_page_list(
     )
 
     return (
-        f"{visible_text}, "
+        f"{text}, "
         f"... +{remaining} more"
     )
 
@@ -348,10 +469,10 @@ def summarize_page_list(
 def compare_pair(
     pair,
     documents,
-    pdf_cache,
+    pdf_byte_cache,
 ):
     """
-    Download and compare one old/new instruction pair.
+    Compare one old/new LEGO instruction pair visually.
     """
     older_number = pair[
         "older_document"
@@ -380,13 +501,13 @@ def compare_pair(
 
     if not older_document:
         raise RuntimeError(
-            f"Could not find metadata for "
+            f"Missing metadata for "
             f"{older_number}."
         )
 
     if not newer_document:
         raise RuntimeError(
-            f"Could not find metadata for "
+            f"Missing metadata for "
             f"{newer_number}."
         )
 
@@ -408,155 +529,275 @@ def compare_pair(
         )
     )
 
-    if older_number not in pdf_cache:
-        older_bytes = download_pdf(
+    if older_number not in pdf_byte_cache:
+        pdf_byte_cache[
+            older_number
+        ] = download_pdf(
             older_document
         )
 
-        pdf_cache[
-            older_number
-        ] = analyze_pdf(
-            older_bytes
-        )
-
-    if newer_number not in pdf_cache:
-        newer_bytes = download_pdf(
+    if newer_number not in pdf_byte_cache:
+        pdf_byte_cache[
+            newer_number
+        ] = download_pdf(
             newer_document
         )
 
-        pdf_cache[
-            newer_number
-        ] = analyze_pdf(
-            newer_bytes
-        )
-
-    older_analysis = pdf_cache[
+    older_bytes = pdf_byte_cache[
         older_number
     ]
 
-    newer_analysis = pdf_cache[
+    newer_bytes = pdf_byte_cache[
         newer_number
     ]
 
-    comparison = compare_page_hashes(
-        older_analysis,
-        newer_analysis,
+    same_file = (
+        file_hash(
+            older_bytes
+        )
+        == file_hash(
+            newer_bytes
+        )
     )
 
-    print("")
-    print(
-        f"Older page count: "
-        f'{older_analysis["page_count"]}'
+    older_pdf = open_pdf(
+        older_bytes
     )
 
-    print(
-        f"Newer page count: "
-        f'{newer_analysis["page_count"]}'
+    newer_pdf = open_pdf(
+        newer_bytes
     )
 
-    same_whole_file = (
-        older_analysis["file_hash"]
-        == newer_analysis["file_hash"]
-    )
+    try:
+        older_page_count = len(
+            older_pdf
+        )
 
-    print(
-        f"Whole PDFs byte-identical: "
-        f"{same_whole_file}"
-    )
+        newer_page_count = len(
+            newer_pdf
+        )
 
-    matching_count = len(
-        comparison["matching_pages"]
-    )
+        print("")
+        print(
+            f"Older page count: "
+            f"{older_page_count}"
+        )
 
-    changed_count = len(
-        comparison["changed_pages"]
-    )
+        print(
+            f"Newer page count: "
+            f"{newer_page_count}"
+        )
 
-    print(
-        f"Same-position matching pages: "
-        f"{matching_count}"
-    )
+        print(
+            f"Whole PDFs byte-identical: "
+            f"{same_file}"
+        )
 
-    print(
-        f"Same-position changed pages: "
-        f"{changed_count}"
-    )
+        shared_page_count = min(
+            older_page_count,
+            newer_page_count,
+        )
 
-    print(
-        "Changed page numbers: "
-        + summarize_page_list(
-            comparison[
-                "changed_pages"
+        identical_pages = []
+        near_identical_pages = []
+        small_change_pages = []
+        substantial_pages = []
+
+        page_results = {}
+
+        for index in range(
+            shared_page_count
+        ):
+            page_number = (
+                index + 1
+            )
+
+            result = compare_page(
+                older_pdf[index],
+                newer_pdf[index],
+            )
+
+            page_results[
+                page_number
+            ] = result
+
+            classification = result[
+                "classification"
             ]
-        )
-    )
 
-    print(
-        "Pages only in older PDF: "
-        + summarize_page_list(
-            comparison[
-                "older_only_pages"
-            ]
-        )
-    )
+            if classification == "IDENTICAL":
+                identical_pages.append(
+                    page_number
+                )
 
-    print(
-        "Pages only in newer PDF: "
-        + summarize_page_list(
-            comparison[
-                "newer_only_pages"
-            ]
-        )
-    )
+            elif classification == "NEAR-IDENTICAL":
+                near_identical_pages.append(
+                    page_number
+                )
 
-    print("")
+            elif classification == "SMALL CHANGE":
+                small_change_pages.append(
+                    page_number
+                )
 
-    if (
-        same_whole_file
-        and changed_count == 0
-        and not comparison[
-            "older_only_pages"
-        ]
-        and not comparison[
-            "newer_only_pages"
-        ]
-    ):
-        verdict = (
-            "IDENTICAL PDF"
+            else:
+                substantial_pages.append(
+                    page_number
+                )
+
+        older_only_pages = list(
+            range(
+                shared_page_count + 1,
+                older_page_count + 1,
+            )
         )
 
-    elif (
-        changed_count == 0
-        and not comparison[
-            "older_only_pages"
-        ]
-        and not comparison[
-            "newer_only_pages"
-        ]
-    ):
-        verdict = (
-            "SAME PAGE CONTENT; "
-            "PDF FILE WRAPPER/METADATA DIFFERS"
+        newer_only_pages = list(
+            range(
+                shared_page_count + 1,
+                newer_page_count + 1,
+            )
         )
 
-    else:
-        verdict = (
-            "PAGE CONTENT DIFFERS — "
-            "needs deeper visual/step comparison"
+        print("")
+        print(
+            f"Visually identical pages: "
+            f"{len(identical_pages)}"
         )
 
-    print(
-        f"VERDICT: {verdict}"
-    )
+        print(
+            f"Near-identical pages: "
+            f"{len(near_identical_pages)}"
+        )
+
+        print(
+            f"Small-change pages: "
+            f"{len(small_change_pages)}"
+        )
+
+        print(
+            f"Substantially changed pages: "
+            f"{len(substantial_pages)}"
+        )
+
+        print("")
+        print(
+            "Near-identical page numbers: "
+            + summarize_page_numbers(
+                near_identical_pages
+            )
+        )
+
+        print(
+            "Small-change page numbers: "
+            + summarize_page_numbers(
+                small_change_pages
+            )
+        )
+
+        print(
+            "Substantial-change page numbers: "
+            + summarize_page_numbers(
+                substantial_pages
+            )
+        )
+
+        print(
+            "Pages only in older PDF: "
+            + summarize_page_numbers(
+                older_only_pages
+            )
+        )
+
+        print(
+            "Pages only in newer PDF: "
+            + summarize_page_numbers(
+                newer_only_pages
+            )
+        )
+
+        changed_pages = (
+            near_identical_pages
+            + small_change_pages
+            + substantial_pages
+        )
+
+        if changed_pages:
+            print("")
+            print(
+                "Changed-page detail:"
+            )
+
+            for page_number in sorted(
+                changed_pages
+            ):
+                result = page_results[
+                    page_number
+                ]
+
+                print(
+                    f"  Page {page_number}: "
+                    f'{result["classification"]} | '
+                    f'difference score '
+                    f'{result["difference_score"]:.6f} | '
+                    f'changed pixels '
+                    f'{result["changed_pixel_percent"]:.3f}%'
+                )
+
+        print("")
+        print("PAIR ASSESSMENT:")
+
+        if (
+            not small_change_pages
+            and not substantial_pages
+            and not older_only_pages
+            and not newer_only_pages
+        ):
+            print(
+                "  LIKELY SAME BUILD INSTRUCTIONS"
+            )
+
+            print(
+                "  Differences appear absent or "
+                "visually negligible."
+            )
+
+        elif (
+            not substantial_pages
+            and not older_only_pages
+            and not newer_only_pages
+        ):
+            print(
+                "  POSSIBLE COSMETIC / PRINTING CHANGE"
+            )
+
+            print(
+                "  No page shows a substantial "
+                "visual difference."
+            )
+
+        else:
+            print(
+                "  MEANINGFUL VISUAL DIFFERENCE FOUND"
+            )
+
+            print(
+                "  Candidate for deeper LEGO "
+                "step/inventory analysis."
+            )
+
+    finally:
+        older_pdf.close()
+        newer_pdf.close()
 
 
 def main():
     print("")
     print(
-        "BrickTrip Official LEGO PDF Comparison"
+        "BrickTrip Visual LEGO PDF Comparison"
     )
     print(
-        "======================================"
+        "===================================="
     )
     print(
         f"Controlled test set: "
@@ -576,18 +817,17 @@ def main():
         f"{len(documents)}"
     )
 
-    pdf_cache = {}
+    pdf_byte_cache = {}
 
     succeeded = 0
     failed = 0
 
     for pair in TEST_PAIRS:
-
         try:
             compare_pair(
                 pair,
                 documents,
-                pdf_cache,
+                pdf_byte_cache,
             )
 
             succeeded += 1
@@ -604,7 +844,9 @@ def main():
 
     print("")
     print("=" * 72)
-    print("PDF TEST COMPLETE")
+    print(
+        "VISUAL PDF TEST COMPLETE"
+    )
     print(
         f"Comparisons succeeded: "
         f"{succeeded}"
