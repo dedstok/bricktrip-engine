@@ -2,7 +2,6 @@ import os
 import re
 from collections import defaultdict
 from datetime import datetime, timezone
-from pathlib import Path
 
 import cv2
 import numpy as np
@@ -21,67 +20,41 @@ supabase = create_client(
 
 
 # ============================================================
-# BRICKTRIP INTEGRATED REVISION DIAGNOSTIC
-# STATE-MACHINE TEST
+# BRICKTRIP PRODUCTION REVISION RESEARCH WORKER
 # ============================================================
 #
-# READ ONLY.
+# This worker processes KNOWN production-redesign sets.
 #
-# Every set in this controlled test is already known to have
-# undergone a production redesign.
+# It DOES:
 #
-# Therefore:
-#
-#   "these PDFs are a reprint"
-#
-# does NOT mean:
-#
-#   "this set has no revision"
-#
-# It means:
-#
-#   "this particular PDF comparison did not characterize the
-#    known redesign, so research must continue."
-#
-#
-# This worker separates:
-#
-# FINDING
-#     What the instruction PDFs tell us.
-#
-# RESEARCH STATE
-#     Whether BrickTrip has enough evidence to characterize the
-#     known redesign or must continue researching.
+# - load up to 10 needs_research candidates
+# - inspect LEGO instruction-document history
+# - understand multi-booklet structure
+# - identify comparable publication generations
+# - download official LEGO PDFs
+# - normalize PDF pages
+# - compare structural instruction geometry
+# - align page sequences
+# - record evidence when a likely real revision is exposed
+# - route unresolved cases to deeper research
+# - log the pipeline run
 #
 #
 # It DOES NOT:
-# - insert evidence
-# - update revision_candidates
-# - create revisions
-# - modify Supabase
 #
+# - create verified revisions
+# - create inventory overrides
+# - claim a redesign does not exist
+# - treat PDF reprints as proof against a redesign
+#
+#
+# These sets are already known redesigns.
+#
+# The worker's job is to CHARACTERIZE them.
 # ============================================================
 
 
-TEST_SET_NUMBERS = [
-    "42171-1",
-    "42129-1",
-    "60004-1",
-    "60085-1",
-    "10194-1",
-    "10214-1",
-    "31058-1",
-]
-
-
-OUTPUT_DIR = Path(
-    "artifacts/bricktrip_pdf_comparisons"
-)
-
-SUMMARY_FILE = (
-    OUTPUT_DIR
-    / "integrated_revision_diagnostic.txt"
-)
+MAX_SETS_PER_RUN = 10
 
 
 # ============================================================
@@ -104,7 +77,7 @@ EDGE_DILATION_SIZE = 3
 
 
 # ============================================================
-# ALIGNMENT SETTINGS
+# PAGE ALIGNMENT SETTINGS
 # ============================================================
 
 ALIGNMENT_BAND = 12
@@ -124,82 +97,45 @@ REPRINT_P10_MIN = 0.70
 
 REPRINT_MINIMUM_MIN = 0.35
 
-REVISION_VERY_LOW = 0.30
-
 REVISION_LOW = 0.60
 
+REVISION_VERY_LOW = 0.30
+
 
 # ============================================================
-# RESEARCH STATES
-# ============================================================
-#
-# PDF FINDINGS:
-#
-# revision_evidence_found
-#     The instruction history exposes a meaningful revision.
-#
-# pdf_reprint_only
-#     Comparable PDFs exist, but they appear to represent the
-#     same build / visual or publication refresh.
-#
-# no_comparable_pdfs
-#     Current instruction metadata does not expose an old/new
-#     comparable pair.
-#
-# needs_deeper_research
-#     PDFs are ambiguous or our automated comparison is not
-#     decisive enough.
-#
-#
-# For KNOWN REDESIGN sets:
-#
-# revision_evidence_found
-#     -> characterization can move forward.
-#
-# pdf_reprint_only
-#     -> KEEP RESEARCHING.
-#
-# no_comparable_pdfs
-#     -> KEEP RESEARCHING.
-#
-# needs_deeper_research
-#     -> KEEP RESEARCHING.
-#
+# DATABASE STATUS VALUES
 # ============================================================
 
+STATUS_NEEDS_RESEARCH = (
+    "needs_research"
+)
 
-def log(message=""):
-    """
-    Print to the GitHub log and save the same text to the
-    diagnostic artifact.
-    """
-    text = str(
-        message
-    )
+STATUS_REVISION_EVIDENCE_FOUND = (
+    "revision_evidence_found"
+)
 
-    print(
-        text
-    )
+STATUS_NEEDS_DEEPER_RESEARCH = (
+    "needs_deeper_research"
+)
 
-    with SUMMARY_FILE.open(
-        "a",
-        encoding="utf-8",
-    ) as handle:
 
-        handle.write(
-            text + "\n"
-        )
+# ============================================================
+# EVIDENCE TYPES
+# ============================================================
+
+EVIDENCE_TYPE_STRUCTURAL_REVISION = (
+    "instruction_structural_revision"
+)
 
 
 def parse_date(value):
     """
-    Parse a Supabase timestamp.
+    Parse a timestamp returned by Supabase.
     """
     if not value:
         return None
 
     try:
-
         return datetime.fromisoformat(
             value.replace(
                 "Z",
@@ -208,15 +144,14 @@ def parse_date(value):
         )
 
     except ValueError:
-
         return None
 
 
 def effective_date(document):
     """
-    Prefer the source modification date.
+    Prefer source_date_modified.
 
-    Fall back to date added.
+    Fall back to source_date_added.
     """
     modified = parse_date(
         document.get(
@@ -241,7 +176,7 @@ def effective_date(document):
 
 def date_key(document):
     """
-    Calendar-date publication key.
+    Return publication date as YYYY-MM-DD.
     """
     value = effective_date(
         document
@@ -255,7 +190,7 @@ def date_key(document):
 
 def document_sort_key(document):
     """
-    Safe chronological sorting.
+    Safe date sorting.
     """
     value = effective_date(
         document
@@ -271,7 +206,7 @@ def document_sort_key(document):
 
 def is_main_instruction(document):
     """
-    Ignore obvious translation, support, and alternate-model PDFs.
+    Ignore translation, support, and alternate-model PDFs.
     """
     description = (
         document.get(
@@ -295,7 +230,6 @@ def is_main_instruction(document):
     ]
 
     for term in ignored_terms:
-
         if (
             term in description
             or term in source_url
@@ -307,9 +241,9 @@ def is_main_instruction(document):
 
 def parse_versions(description):
     """
-    Parse LEGO regional/version labels.
+    Parse LEGO V labels.
 
-    Handles:
+    Examples:
 
     V29
     V29/V118
@@ -318,9 +252,7 @@ def parse_versions(description):
     if not description:
         return tuple()
 
-    text = (
-        description.upper()
-    )
+    text = description.upper()
 
     versions = []
 
@@ -336,7 +268,6 @@ def parse_versions(description):
         )
 
         if first_label not in versions:
-
             versions.append(
                 first_label
             )
@@ -362,23 +293,21 @@ def parse_versions(description):
 
 def parse_booklet_slot(description):
     """
-    Parse physical instruction booklet identity.
+    Parse physical booklet identity.
 
     Examples:
 
     1/2
     2/3
-    BOOK 1/3
+    BOOK 2/3
     BOOK2/3
 
-    Large BI/page-printing fractions are rejected.
+    Large BI print-code fractions are rejected.
     """
     if not description:
         return None
 
-    text = (
-        description.upper()
-    )
+    text = description.upper()
 
     candidates = []
 
@@ -433,11 +362,45 @@ def parse_booklet_slot(description):
     )
 
 
+def get_candidates():
+    """
+    Load up to MAX_SETS_PER_RUN clean queue candidates.
+    """
+    response = (
+        supabase
+        .table(
+            "revision_candidates"
+        )
+        .select(
+            "id,"
+            "set_num,"
+            "status,"
+            "reason"
+        )
+        .eq(
+            "status",
+            STATUS_NEEDS_RESEARCH,
+        )
+        .order(
+            "id"
+        )
+        .limit(
+            MAX_SETS_PER_RUN
+        )
+        .execute()
+    )
+
+    return (
+        response.data
+        or []
+    )
+
+
 def get_instruction_documents(
     set_num,
 ):
     """
-    Fetch instruction metadata for one set.
+    Fetch all instruction-document metadata for a set.
     """
     response = (
         supabase
@@ -521,8 +484,10 @@ def publication_generations(
         })
 
     generations.sort(
-        key=lambda item:
-        item["date"]
+        key=lambda generation:
+        generation[
+            "date"
+        ]
     )
 
     return generations
@@ -532,7 +497,7 @@ def representative_document(
     generation,
 ):
     """
-    Pick one deterministic regional PDF from a publication group.
+    Pick one deterministic regional PDF from a generation.
     """
     documents = (
         generation[
@@ -559,13 +524,13 @@ def build_metadata_pairs(
     documents,
 ):
     """
-    Determine old/new PDFs that are actually comparable.
+    Build comparable old/new PDF candidates.
 
-    Multi-booklet sets:
-        compare 1/3 only with later 1/3, etc.
+    Multi-booklet:
+        compare like booklet slots only.
 
-    No-slot sets:
-        compare repeated V-label lineages.
+    No booklet slots:
+        compare repeated LEGO V-label lineages.
     """
     primary = [
         document
@@ -607,7 +572,7 @@ def build_metadata_pairs(
     pairs = []
 
     # --------------------------------------------------------
-    # MULTI-BOOKLET SETS
+    # MULTI-BOOKLET
     # --------------------------------------------------------
 
     if booklet_groups:
@@ -671,7 +636,7 @@ def build_metadata_pairs(
         return pairs
 
     # --------------------------------------------------------
-    # SINGLE-BOOKLET / NO-SLOT SETS
+    # SINGLE BOOKLET / NO SLOT
     # --------------------------------------------------------
 
     version_groups = defaultdict(
@@ -799,10 +764,8 @@ def download_pdf(
             document_number
         ]
 
-    source_url = (
-        document.get(
-            "source_url"
-        )
+    source_url = document.get(
+        "source_url"
     )
 
     if not source_url:
@@ -813,7 +776,7 @@ def download_pdf(
             f"has no source_url."
         )
 
-    log(
+    print(
         f"    Downloading "
         f"{document_number}..."
     )
@@ -839,7 +802,7 @@ def download_pdf(
             f"did not download as PDF."
         )
 
-    log(
+    print(
         f"      "
         f"{len(pdf_bytes):,} bytes"
     )
@@ -855,7 +818,7 @@ def open_pdf(
     pdf_bytes,
 ):
     """
-    Open PDF bytes with PyMuPDF.
+    Open PDF bytes.
     """
     return pymupdf.open(
         stream=pdf_bytes,
@@ -867,7 +830,7 @@ def render_page(
     page,
 ):
     """
-    Render one PDF page into a grayscale numpy image.
+    Render one PDF page to grayscale.
     """
     matrix = pymupdf.Matrix(
         RENDER_SCALE,
@@ -895,7 +858,7 @@ def find_content_bbox(
     image,
 ):
     """
-    Detect printed content area while ignoring white margins.
+    Detect non-white printed content.
     """
     mask = (
         image
@@ -959,7 +922,7 @@ def normalize_page(
     image,
 ):
     """
-    Crop margins and normalize page scale.
+    Crop margins and normalize scale.
     """
     (
         left,
@@ -1054,7 +1017,7 @@ def create_edges(
     image,
 ):
     """
-    Create color-independent structural page representation.
+    Create structural edge map.
     """
     blurred = cv2.GaussianBlur(
         image,
@@ -1090,7 +1053,7 @@ def prepare_pdf(
     pdf,
 ):
     """
-    Render every PDF page once.
+    Render and structurally prepare every page once.
     """
     prepared = []
 
@@ -1122,7 +1085,7 @@ def dice_similarity(
     newer_edges,
 ):
     """
-    Structural Dice similarity score.
+    Structural Dice similarity.
     """
     older_mask = (
         older_edges > 0
@@ -1180,7 +1143,7 @@ def build_similarity_cache(
     newer_pages,
 ):
     """
-    Compare pages near the expected sequence position.
+    Compare only pages near expected sequence position.
     """
     cache = {}
 
@@ -1236,7 +1199,9 @@ def align_pages(
     similarity_cache,
 ):
     """
-    Global page-sequence alignment with insertion/deletion support.
+    Global sequence alignment.
+
+    Allows inserted and removed PDF pages.
     """
     old_count = len(
         older_pages
@@ -1519,7 +1484,7 @@ def analyze_pdf_pair(
     pdf_cache,
 ):
     """
-    Perform structural aligned comparison of one old/new PDF pair.
+    Structurally compare one old/new PDF pair.
     """
     older_document = (
         pair[
@@ -1648,6 +1613,12 @@ def analyze_pdf_pair(
                 "were produced."
             )
 
+        mean = float(
+            np.mean(
+                similarities
+            )
+        )
+
         median = float(
             np.median(
                 similarities
@@ -1663,12 +1634,6 @@ def analyze_pdf_pair(
 
         minimum = float(
             np.min(
-                similarities
-            )
-        )
-
-        mean = float(
-            np.mean(
                 similarities
             )
         )
@@ -1744,14 +1709,7 @@ def classify_pair(
     result,
 ):
     """
-    Classify what THIS PDF PAIR tells us.
-
-    Important:
-
-    pdf_reprint_only does NOT mean the known set redesign does
-    not exist.
-
-    It only means THIS pair does not expose it.
+    Determine what one PDF pair tells us.
     """
     gaps = (
         result[
@@ -1793,7 +1751,7 @@ def classify_pair(
     )
 
     # --------------------------------------------------------
-    # LOCALIZED REAL-REVISION FINGERPRINT
+    # LOCALIZED REVISION PATTERN
     # --------------------------------------------------------
 
     if (
@@ -1823,7 +1781,7 @@ def classify_pair(
         )
 
     # --------------------------------------------------------
-    # REPRINT / SAME-BUILD PDF PAIR
+    # SAME-BUILD / REPRINT PAIR
     # --------------------------------------------------------
 
     if (
@@ -1840,22 +1798,16 @@ def classify_pair(
             "pdf_reprint_only"
         )
 
-    # --------------------------------------------------------
-    # AMBIGUOUS
-    # --------------------------------------------------------
-
     return (
         "needs_deeper_research"
     )
 
 
-def classify_set_finding(
+def set_finding(
     pair_results,
 ):
     """
-    Roll PDF-pair findings into a set-level finding.
-
-    This is NOT yet the queue disposition.
+    Roll pair findings into one set finding.
     """
     if not pair_results:
 
@@ -1864,10 +1816,10 @@ def classify_set_finding(
         )
 
     classifications = [
-        item[
+        result[
             "classification"
         ]
-        for item
+        for result
         in pair_results
     ]
 
@@ -1905,58 +1857,221 @@ def classify_set_finding(
     )
 
 
-def research_state_for_known_redesign(
-    finding,
+def build_evidence_description(
+    pair,
+    result,
 ):
     """
-    Convert the PDF finding into a research disposition for a set
-    that is ALREADY KNOWN to have a production redesign.
-
-    This is the critical state-machine rule.
-
-    Only actual revision evidence allows the characterization
-    process to advance.
-
-    Everything else stays in research.
+    Create human-readable structural revision evidence.
     """
-    if (
-        finding
-        == "revision_evidence_found"
-    ):
-
-        return (
-            "revision_evidence_found"
-        )
-
     return (
-        "needs_deeper_research"
+        "Official LEGO instruction comparison found structural "
+        "revision evidence. "
+        f'{pair["identity"]}: '
+        f'{result["older_document"]} '
+        f'({pair["older_generation"]["date"]}) '
+        f'-> '
+        f'{result["newer_document"]} '
+        f'({pair["newer_generation"]["date"]}). '
+        f'Pages '
+        f'{result["older_pages"]}'
+        f' -> '
+        f'{result["newer_pages"]}; '
+        f'alignment gaps '
+        f'{result["insertions"]} newer-only / '
+        f'{result["deletions"]} older-only; '
+        f'median structural similarity '
+        f'{result["median"]:.4f}; '
+        f'10th percentile '
+        f'{result["p10"]:.4f}; '
+        f'minimum '
+        f'{result["minimum"]:.4f}; '
+        f'{result["low_count"]} aligned pages '
+        f'below {REVISION_LOW:.2f}.'
     )
 
 
-def research_set(
+def evidence_exists(
     set_num,
+    source_url,
+    description,
+):
+    """
+    Prevent duplicate evidence if a partially completed set is retried.
+    """
+    query = (
+        supabase
+        .table(
+            "evidence"
+        )
+        .select(
+            "id"
+        )
+        .eq(
+            "set_num",
+            set_num,
+        )
+        .eq(
+            "source_type",
+            EVIDENCE_TYPE_STRUCTURAL_REVISION,
+        )
+        .eq(
+            "description",
+            description,
+        )
+        .limit(1)
+    )
+
+    if source_url:
+
+        query = query.eq(
+            "source_url",
+            source_url,
+        )
+
+    response = (
+        query.execute()
+    )
+
+    return bool(
+        response.data
+    )
+
+
+def save_revision_evidence(
+    set_num,
+    pair,
+    result,
+):
+    """
+    Save one evidence row for a structurally meaningful PDF pair.
+    """
+    newer_document = (
+        pair[
+            "newer_document"
+        ]
+    )
+
+    source_url = (
+        newer_document.get(
+            "source_url"
+        )
+    )
+
+    description = (
+        build_evidence_description(
+            pair,
+            result,
+        )
+    )
+
+    if evidence_exists(
+        set_num,
+        source_url,
+        description,
+    ):
+
+        print(
+            "    Evidence already exists; "
+            "skipping duplicate."
+        )
+
+        return
+
+    evidence_row = {
+        "set_num":
+            set_num,
+        "revision_id":
+            None,
+        "source_type":
+            EVIDENCE_TYPE_STRUCTURAL_REVISION,
+        "source_url":
+            source_url,
+        "description":
+            description,
+        "confidence":
+            0.75,
+    }
+
+    (
+        supabase
+        .table(
+            "evidence"
+        )
+        .insert(
+            evidence_row
+        )
+        .execute()
+    )
+
+    print(
+        "    Saved structural "
+        "revision evidence."
+    )
+
+
+def update_candidate(
+    candidate_id,
+    status,
+    reason,
+):
+    """
+    Update one revision candidate.
+    """
+    (
+        supabase
+        .table(
+            "revision_candidates"
+        )
+        .update({
+            "status":
+                status,
+            "reason":
+                reason,
+            "updated_at":
+                datetime.now(
+                    timezone.utc
+                ).isoformat(),
+        })
+        .eq(
+            "id",
+            candidate_id,
+        )
+        .execute()
+    )
+
+
+def process_candidate(
+    candidate,
     pdf_cache,
 ):
     """
-    Run integrated read-only research for one known-redesign
-    benchmark set.
+    Research one known-redesign queue candidate.
     """
-    log("")
-    log(
+    candidate_id = (
+        candidate[
+            "id"
+        ]
+    )
+
+    set_num = (
+        candidate[
+            "set_num"
+        ]
+    )
+
+    print("")
+    print(
         "=" * 72
     )
 
-    log(
-        f"SET {set_num}"
+    print(
+        f"RESEARCHING "
+        f"{set_num}"
     )
 
-    log(
+    print(
         "=" * 72
-    )
-
-    log(
-        "Benchmark status: "
-        "KNOWN PRODUCTION REDESIGN"
     )
 
     documents = (
@@ -1974,12 +2089,12 @@ def research_set(
         )
     ]
 
-    log(
+    print(
         f"Instruction records: "
         f"{len(documents)}"
     )
 
-    log(
+    print(
         f"Primary instruction PDFs: "
         f"{len(primary_documents)}"
     )
@@ -1990,102 +2105,91 @@ def research_set(
         )
     )
 
-    log(
-        f"Comparable metadata pairs: "
+    print(
+        f"Comparable PDF pairs: "
         f"{len(pairs)}"
     )
 
+    # --------------------------------------------------------
+    # NO COMPARABLE PDF PAIRS
+    # --------------------------------------------------------
+
     if not pairs:
 
-        finding = (
-            "no_comparable_pdfs"
+        reason = (
+            "Known production redesign, but current instruction "
+            "metadata does not expose comparable old/new PDFs. "
+            "Requires deeper research."
         )
 
-        research_state = (
-            research_state_for_known_redesign(
-                finding
-            )
+        update_candidate(
+            candidate_id,
+            STATUS_NEEDS_DEEPER_RESEARCH,
+            reason,
         )
 
-        log("")
-        log(
-            f"PDF FINDING: "
-            f"{finding}"
-        )
-
-        log(
-            f"RESEARCH STATE: "
-            f"{research_state}"
-        )
-
-        log(
-            "Reason: redesign is known, but current "
-            "instruction metadata does not expose a "
-            "comparable old/new PDF generation."
+        print(
+            "RESULT: "
+            "needs_deeper_research "
+            "(no comparable PDFs)"
         )
 
         return {
             "set_num":
                 set_num,
             "finding":
-                finding,
-            "research_state":
-                research_state,
-            "pairs":
-                [],
+                "no_comparable_pdfs",
+            "status":
+                STATUS_NEEDS_DEEPER_RESEARCH,
+            "evidence_rows":
+                0,
         }
 
     pair_results = []
+
+    saved_evidence_count = 0
 
     for pair_index, pair in enumerate(
         pairs,
         start=1,
     ):
 
-        older_document = (
+        older_number = str(
             pair[
                 "older_document"
-            ]
-        )
-
-        newer_document = (
-            pair[
-                "newer_document"
-            ]
-        )
-
-        older_number = str(
-            older_document.get(
+            ].get(
                 "document_number"
             )
         )
 
         newer_number = str(
-            newer_document.get(
+            pair[
+                "newer_document"
+            ].get(
                 "document_number"
             )
         )
 
-        log("")
-        log(
+        print("")
+        print(
             f"  Pair "
             f"{pair_index}/"
             f"{len(pairs)}"
         )
 
-        log(
+        print(
             f"  Identity: "
             f'{pair["identity"]}'
         )
 
-        log(
+        print(
             f"  "
             f"{older_number} "
             f"-> "
             f"{newer_number}"
         )
 
-        log(
+        print(
             f"  "
             f'{pair["older_generation"]["date"]}'
             f" -> "
@@ -2108,14 +2212,6 @@ def research_set(
             )
 
             result[
-                "identity"
-            ] = (
-                pair[
-                    "identity"
-                ]
-            )
-
-            result[
                 "classification"
             ] = (
                 classification
@@ -2125,22 +2221,14 @@ def research_set(
                 result
             )
 
-            log(
-                f"    Old pages: "
+            print(
+                f"    Pages: "
                 f'{result["older_pages"]}'
-            )
-
-            log(
-                f"    New pages: "
+                f" -> "
                 f'{result["newer_pages"]}'
             )
 
-            log(
-                f"    Page count delta: "
-                f'{result["page_difference"]:+d}'
-            )
-
-            log(
+            print(
                 f"    Alignment gaps: "
                 f'{result["insertions"]} '
                 f"new-only / "
@@ -2148,55 +2236,58 @@ def research_set(
                 f"old-only"
             )
 
-            log(
+            print(
                 f"    Mean similarity: "
                 f'{result["mean"]:.4f}'
             )
 
-            log(
+            print(
                 f"    Median similarity: "
                 f'{result["median"]:.4f}'
             )
 
-            log(
+            print(
                 f"    10th percentile: "
                 f'{result["p10"]:.4f}'
             )
 
-            log(
+            print(
                 f"    Minimum: "
                 f'{result["minimum"]:.4f}'
             )
 
-            log(
+            print(
                 f"    Pages below "
                 f"{REVISION_LOW:.2f}: "
                 f'{result["low_count"]}'
             )
 
-            log(
-                f"    Pages below "
-                f"{REVISION_VERY_LOW:.2f}: "
-                f'{result["very_low_count"]}'
-            )
-
-            log(
-                f"    PDF PAIR FINDING: "
+            print(
+                f"    PAIR FINDING: "
                 f"{classification}"
             )
 
+            if (
+                classification
+                == "revision_evidence_found"
+            ):
+
+                save_revision_evidence(
+                    set_num,
+                    pair,
+                    result,
+                )
+
+                saved_evidence_count += 1
+
         except Exception as error:
 
-            log(
-                f"    ERROR: "
+            print(
+                f"    Pair error: "
                 f"{error}"
             )
 
             pair_results.append({
-                "identity":
-                    pair[
-                        "identity"
-                    ],
                 "classification":
                     "needs_deeper_research",
                 "error":
@@ -2206,271 +2297,348 @@ def research_set(
             })
 
     finding = (
-        classify_set_finding(
+        set_finding(
             pair_results
         )
     )
 
-    research_state = (
-        research_state_for_known_redesign(
-            finding
-        )
-    )
-
-    log("")
-    log(
-        f"PDF FINDING: "
-        f"{finding}"
-    )
-
-    log(
-        f"RESEARCH STATE: "
-        f"{research_state}"
-    )
+    # --------------------------------------------------------
+    # REVISION EVIDENCE FOUND
+    # --------------------------------------------------------
 
     if (
         finding
         == "revision_evidence_found"
     ):
 
-        log(
-            "Reason: instruction comparison exposed "
-            "structural evidence consistent with the "
-            "known production redesign."
+        reason = (
+            "Structural differences were found between comparable "
+            "official LEGO instruction generations. Revision "
+            "evidence recorded; characterization can continue."
         )
 
-    elif (
+        update_candidate(
+            candidate_id,
+            STATUS_REVISION_EVIDENCE_FOUND,
+            reason,
+        )
+
+        print("")
+        print(
+            "RESULT: "
+            "revision_evidence_found"
+        )
+
+        return {
+            "set_num":
+                set_num,
+            "finding":
+                finding,
+            "status":
+                STATUS_REVISION_EVIDENCE_FOUND,
+            "evidence_rows":
+                saved_evidence_count,
+        }
+
+    # --------------------------------------------------------
+    # PDF REPRINT ONLY
+    # --------------------------------------------------------
+
+    if (
         finding
         == "pdf_reprint_only"
     ):
 
-        log(
-            "Reason: compared PDFs appear to describe "
-            "the same build. Because this set is already "
-            "known to have a production redesign, research "
-            "must continue using other instruction generations "
-            "or evidence sources."
+        reason = (
+            "Known production redesign, but compared official LEGO "
+            "PDFs appear to describe the same build or a publication "
+            "refresh. Requires deeper research to locate the redesign."
         )
 
-    elif (
-        finding
-        == "needs_deeper_research"
-    ):
-
-        log(
-            "Reason: current PDF evidence is ambiguous "
-            "or inconsistent. Do not close this candidate."
+        update_candidate(
+            candidate_id,
+            STATUS_NEEDS_DEEPER_RESEARCH,
+            reason,
         )
 
-    else:
-
-        log(
-            "Reason: current instruction metadata does "
-            "not expose the known redesign."
+        print("")
+        print(
+            "RESULT: "
+            "needs_deeper_research "
+            "(PDF reprint only)"
         )
+
+        return {
+            "set_num":
+                set_num,
+            "finding":
+                finding,
+            "status":
+                STATUS_NEEDS_DEEPER_RESEARCH,
+            "evidence_rows":
+                saved_evidence_count,
+        }
+
+    # --------------------------------------------------------
+    # AMBIGUOUS
+    # --------------------------------------------------------
+
+    reason = (
+        "Known production redesign, but current automated PDF "
+        "comparison is ambiguous or incomplete. Requires deeper "
+        "research; candidate must not be closed."
+    )
+
+    update_candidate(
+        candidate_id,
+        STATUS_NEEDS_DEEPER_RESEARCH,
+        reason,
+    )
+
+    print("")
+    print(
+        "RESULT: "
+        "needs_deeper_research "
+        "(ambiguous PDF evidence)"
+    )
 
     return {
         "set_num":
             set_num,
         "finding":
-            finding,
-        "research_state":
-            research_state,
-        "pairs":
-            pair_results,
+            "needs_deeper_research",
+        "status":
+            STATUS_NEEDS_DEEPER_RESEARCH,
+        "evidence_rows":
+            saved_evidence_count,
     }
 
 
+def record_pipeline_run(
+    status,
+    records_processed,
+    error_message=None,
+):
+    """
+    Record one worker run in pipeline_runs.
+    """
+    now = datetime.now(
+        timezone.utc
+    ).isoformat()
+
+    row = {
+        "job_name":
+            "research_known_revisions",
+        "status":
+            status,
+        "records_processed":
+            records_processed,
+        "error_message":
+            error_message,
+        "started_at":
+            now,
+        "finished_at":
+            now,
+    }
+
+    (
+        supabase
+        .table(
+            "pipeline_runs"
+        )
+        .insert(
+            row
+        )
+        .execute()
+    )
+
+
 def main():
-    OUTPUT_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
+    print("")
+    print(
+        "BrickTrip Production Revision Research"
     )
 
-    SUMMARY_FILE.write_text(
-        "",
-        encoding="utf-8",
+    print(
+        "======================================"
     )
 
-    log("")
-    log(
-        "BrickTrip Revision Research State Diagnostic"
+    print(
+        f"Maximum sets this run: "
+        f"{MAX_SETS_PER_RUN}"
     )
 
-    log(
-        "==========================================="
+    candidates = (
+        get_candidates()
     )
 
-    log(
-        "READ ONLY — database writes: NONE"
+    print(
+        f"Candidates loaded: "
+        f"{len(candidates)}"
     )
 
-    log("")
-    log(
-        "All benchmark sets in this run are "
-        "already known production redesigns."
-    )
+    if not candidates:
 
-    log("")
-    log(
-        f"Benchmark sets: "
-        f"{len(TEST_SET_NUMBERS)}"
-    )
-
-    pdf_cache = {}
-
-    results = []
-
-    succeeded = 0
-    failed = 0
-
-    for set_num in (
-        TEST_SET_NUMBERS
-    ):
+        print(
+            "No needs_research candidates remain."
+        )
 
         try:
 
-            result = research_set(
-                set_num,
+            record_pipeline_run(
+                status="completed",
+                records_processed=0,
+                error_message=None,
+            )
+
+        except Exception as error:
+
+            print(
+                f"Could not record pipeline run: "
+                f"{error}"
+            )
+
+        return
+
+    pdf_cache = {}
+
+    processed = 0
+
+    failed = 0
+
+    revision_evidence_sets = 0
+
+    deeper_research_sets = 0
+
+    evidence_rows_saved = 0
+
+    for candidate in candidates:
+
+        try:
+
+            result = process_candidate(
+                candidate,
                 pdf_cache,
             )
 
-            results.append(
-                result
+            processed += 1
+
+            evidence_rows_saved += (
+                result[
+                    "evidence_rows"
+                ]
             )
 
-            succeeded += 1
+            if (
+                result[
+                    "status"
+                ]
+                == STATUS_REVISION_EVIDENCE_FOUND
+            ):
+
+                revision_evidence_sets += 1
+
+            else:
+
+                deeper_research_sets += 1
 
         except Exception as error:
 
             failed += 1
 
-            log("")
-            log(
-                f"FATAL ERROR for "
+            set_num = (
+                candidate.get(
+                    "set_num"
+                )
+                or "unknown"
+            )
+
+            print("")
+            print(
+                f"ERROR processing "
                 f"{set_num}: "
                 f"{error}"
             )
 
-            results.append({
-                "set_num":
-                    set_num,
-                "finding":
-                    "needs_deeper_research",
-                "research_state":
-                    "needs_deeper_research",
-                "error":
-                    str(
-                        error
-                    ),
-            })
+            # Leave a genuinely failed candidate in needs_research
+            # so a later run can retry it.
 
-    log("")
-    log(
+    print("")
+    print(
         "=" * 72
     )
 
-    log(
-        "BENCHMARK SUMMARY"
+    print(
+        "RUN SUMMARY"
     )
 
-    log(
+    print(
         "=" * 72
     )
 
-    for result in results:
-
-        log(
-            f'{result["set_num"]}: '
-            f'finding='
-            f'{result["finding"]} | '
-            f'research_state='
-            f'{result["research_state"]}'
-        )
-
-    finding_counts = defaultdict(
-        int
+    print(
+        f"Successfully processed: "
+        f"{processed}"
     )
 
-    state_counts = defaultdict(
-        int
-    )
-
-    for result in results:
-
-        finding_counts[
-            result[
-                "finding"
-            ]
-        ] += 1
-
-        state_counts[
-            result[
-                "research_state"
-            ]
-        ] += 1
-
-    log("")
-    log(
-        "PDF finding totals:"
-    )
-
-    for finding in [
-        "revision_evidence_found",
-        "pdf_reprint_only",
-        "no_comparable_pdfs",
-        "needs_deeper_research",
-    ]:
-
-        log(
-            f"  "
-            f"{finding}: "
-            f"{finding_counts[finding]}"
-        )
-
-    log("")
-    log(
-        "Research-state totals:"
-    )
-
-    for state in [
-        "revision_evidence_found",
-        "needs_deeper_research",
-    ]:
-
-        log(
-            f"  "
-            f"{state}: "
-            f"{state_counts[state]}"
-        )
-
-    log("")
-    log(
-        "IMPORTANT:"
-    )
-
-    log(
-        "For known-redesign sets, "
-        "pdf_reprint_only and no_comparable_pdfs "
-        "remain active research cases."
-    )
-
-    log("")
-    log(
-        f"Sets completed: "
-        f"{succeeded}"
-    )
-
-    log(
-        f"Sets failed: "
+    print(
+        f"Failed: "
         f"{failed}"
     )
 
-    log(
-        "Database writes: 0"
+    print(
+        f"Revision-evidence sets: "
+        f"{revision_evidence_sets}"
     )
 
-    log(
+    print(
+        f"Needs-deeper-research sets: "
+        f"{deeper_research_sets}"
+    )
+
+    print(
+        f"Structural evidence rows saved: "
+        f"{evidence_rows_saved}"
+    )
+
+    if failed:
+
+        run_status = (
+            "completed_with_errors"
+        )
+
+        error_message = (
+            f"{failed} set(s) failed."
+        )
+
+    else:
+
+        run_status = (
+            "completed"
+        )
+
+        error_message = None
+
+    try:
+
+        record_pipeline_run(
+            status=run_status,
+            records_processed=processed,
+            error_message=error_message,
+        )
+
+        print(
+            "Pipeline run recorded."
+        )
+
+    except Exception as error:
+
+        print(
+            f"Could not record pipeline run: "
+            f"{error}"
+        )
+
+    print(
         "=" * 72
     )
 
